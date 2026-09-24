@@ -1,0 +1,38 @@
+{
+  "_说明": "示例配置。复制到 ~/.pi/agent/webdav-backup.json 后按需修改，或直接运行 /backup-setup 用向导生成。",
+
+  "enabled": true,
+
+  "remote": {
+    "_url_坚果云": "https://dav.jianguoyun.com/dav/",
+    "_url_Nextcloud": "https://your-cloud.example.com/remote.php/dav/files/<用户名>/",
+    "_url_群晖WebDAV": "https://your-nas.example.com:5006/pi-backup",
+    "_url_自建rclone": "http://127.0.0.1:8080/pi-backup",
+    "url": "https://dav.jianguoyun.com/dav/",
+
+    "_username_说明": "坚果云填注册邮箱；Nextcloud 填用户名",
+    "username": "you@example.com",
+
+    "_password_说明": "密钥引用，推荐 dpapi:webdav-password（先用 /backup keys set webdav-password 创建）。也可用 $ENV_VAR 或 file:路径；留空则读环境变量 PI_WEBDAV_BACKUP_PASSWORD",
+    "password": "dpapi:webdav-password",
+
+    "remoteDir": "pi-backup",
+    "remoteName": "pi-agent"
+  },
+
+  "scope": ["."],
+  "exclude": [],
+  "includeSessions": false,
+  "snapshot": false,
+
+  "encrypt": false,
+  "encryptKey": "dpapi:backup-key",
+
+  "backupOnExit": true,
+  "backupOnExitMinIntervalMinutes": 30,
+  "backupOnExitTimeoutMs": 600000,
+
+  "keepVersions": 10,
+  "timeoutMs": 60000,
+  "insecureTls": false
+}
