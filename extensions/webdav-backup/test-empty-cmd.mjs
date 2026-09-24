@@ -139,6 +139,24 @@ async function main() {
     JSON.stringify(badJson),
   );
 
+  // 3d. 输出契约：人类模式末行必须是 JSON 汇总（/backup 的「备份完成 ✅」提醒靠它）
+  const sum = lastJson(empty.stdout);
+  check(
+    "人类模式末行是 JSON 汇总（ok + remotePath + files）",
+    sum.ok === true && typeof sum.remotePath === "string" && Number(sum.files) >= 1,
+    empty.stdout.trim().split("\n").pop(),
+  );
+
+  // 3e. 失败时汇总必须带非空 error（否则前端只能弹「失败：」空提醒）
+  const noConfDir = mkdtempSync(join(tmpdir(), "pi-emptycmd-noconf-"));
+  const noConf = await runCli(["backup"], { PI_CODING_AGENT_DIR: noConfDir });
+  const noConfJson = lastJson(noConf.stdout);
+  check(
+    "失败时 JSON 汇总带非空 error",
+    noConf.code === 1 && noConfJson.ok === false && Boolean(String(noConfJson.error).trim()),
+    JSON.stringify(noConfJson),
+  );
+
   console.log(`\n结果：${pass} 通过，${fail} 失败`);
   process.exit(fail ? 1 : 0);
 }

@@ -106,7 +106,9 @@ function runCli(
       const text = d.toString("utf8");
       stdout += text;
       for (const line of text.split("\n")) {
-        if (line.trim()) ctx.ui.setStatus("webdav-backup", line.slice(0, 90));
+        const t = line.trim();
+        // 末行 JSON 汇总是给程序读的，不刷到状态栏
+        if (t && !t.startsWith("{")) ctx.ui.setStatus("webdav-backup", line.slice(0, 90));
       }
     });
     child.stderr?.on("data", (d: Buffer) => {
@@ -441,7 +443,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         if (rr.ok && info.ok) {
           ctx.ui.notify(`恢复完成：${info.files} 个文件 → ${info.dest}`, "info");
         } else {
-          ctx.ui.notify(`恢复失败：${info.error ?? rr.stderr.trim()}`, "error");
+          ctx.ui.notify(`恢复失败：${info.error || rr.stderr.trim() || `退出码 ${rr.code}`}`, "error");
         }
         return;
       }
@@ -524,7 +526,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
           ctx.ui.notify("完成", "info");
         }
       } else {
-        ctx.ui.notify(`失败：${summary.error ?? r.stderr.trim() ?? `退出码 ${r.code}`}`, "error");
+        ctx.ui.notify(`失败：${summary.error || r.stderr.trim() || `退出码 ${r.code}`}`, "error");
       }
     },
   });

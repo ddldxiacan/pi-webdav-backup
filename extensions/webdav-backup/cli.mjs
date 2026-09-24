@@ -18,7 +18,8 @@
  *   node cli.mjs install-cron [--time HH:MM]   安装 Windows 计划任务（每日备份）
  *   node cli.mjs uninstall-cron           移除计划任务
  *
- * 输出人类可读文本或 JSON（--json），退出码 0 成功 / 1 失败。
+ * 输出人类可读文本，末行固定是 JSON 汇总；加 --json 则只输出该汇总行。
+ * 退出码 0 成功 / 1 失败。
  *   --value 优先，其次读 stdin（避免密钥出现在进程列表里）
  */
 
@@ -60,7 +61,9 @@ function logTo(line) {
 }
 
 function finish(payload, code) {
-  if (asJson) process.stdout.write(`${JSON.stringify(payload)}\n`);
+  // JSON 汇总固定作为最后一行输出：扩展入口按「最后一行 JSON」解析结果
+  // 并渲染完成提醒；--json 模式下前面没有日志行，只有这一行。
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
   process.exit(code ?? (payload.ok ? 0 : 1));
 }
 
