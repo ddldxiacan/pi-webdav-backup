@@ -34,6 +34,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseCliJson } from "./webdav-backup/json.mjs";
+import { pickCommand } from "./webdav-backup/args.mjs";
 
 // bundler/jiti 下 import.meta.url 可能不可用，做兜底
 const EXT_DIR = (() => {
@@ -211,7 +212,8 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       return f.length ? f.map((s) => ({ value: s, label: s })) : null;
     },
     handler: async (args, ctx) => {
-      const sub = (args.trim().split(/\s+/)[0] ?? "run").toLowerCase();
+      // 注意：不能写 `split(/\s+/)[0] ?? "run"`——空串会绕过 ?? 兜底（见 args.mjs）
+      const sub = pickCommand(args.trim().split(/\s+/), "run");
 
       if (sub === "help") {
         ctx.ui.notify(

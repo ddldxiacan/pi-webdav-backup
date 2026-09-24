@@ -36,9 +36,11 @@ import {
   resolveSecret,
   isPlaintextSecret,
 } from "./secrets.mjs";
+import { pickCommand } from "./args.mjs";
 
 const args = process.argv.slice(2);
-const cmd = (args[0] ?? "backup").toLowerCase();
+// 注意：不能写 `args[0] ?? "backup"`——空串会绕过 ?? 兜底（见 args.mjs）
+const cmd = pickCommand(args, "backup");
 const has = (f) => args.includes(f);
 const val = (f, d = null) => {
   const i = args.indexOf(f);
