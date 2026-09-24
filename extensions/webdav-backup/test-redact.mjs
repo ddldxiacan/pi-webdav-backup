@@ -107,6 +107,30 @@ check("嵌套路径 auth.json 也被脱敏", !r12.includes("sk-nested-canary"), 
 check("空对象不报错", (() => { try { redact("auth.json", "{}"); return true; } catch { return false; } })());
 check("null 值不报错", (() => { try { redact("auth.json", '{"a":null,"b":1}'); return true; } catch { return false; } })());
 
+// ── 10b. 回归：布尔/数字不被误伤，密钥引用保留（本地实测发现）
+const rBool = redact(
+  "webdav-backup.json",
+  JSON.stringify({ includeSessions: false, snapshot: true, keepVersions: 10, sessionDir: "C:/sessions" }),
+);
+check("includeSessions:false 不被误伤（回归）", !rBool.includes("__REDACTED__"), rBool);
+check("sessionDir 不被误伤", rBool.includes("C:/sessions"), rBool);
+
+const rTokFlag = redact("webdav-backup.json", JSON.stringify({ tokenEnabled: false, keyCount: 3 }));
+check("布尔/数字在敏感字段名下也不误替换", !rTokFlag.includes("__REDACTED__"), rTokFlag);
+
+const rSessTok = redact("webdav-backup.json", JSON.stringify({ sessionToken: "tok-123456789012" }));
+check("sessionToken 仍被脱敏", !rSessTok.includes("tok-123456789012"), rSessTok);
+
+const rRef2 = redact(
+  "webdav-backup.json",
+  JSON.stringify({ remote: { password: "dpapi:webdav-password" }, encryptKey: "$PI_WEBDAV_BACKUP_KEY" }),
+);
+check("password 的 dpapi: 引用保留", rRef2.includes("dpapi:webdav-password"), rRef2);
+check("encryptKey 的 $ENV 引用保留", rRef2.includes("$PI_WEBDAV_BACKUP_KEY"), rRef2);
+
+const rPlain2 = redact("webdav-backup.json", JSON.stringify({ remote: { password: "MyPassword123" } }));
+check("password 明文仍被脱敏", !rPlain2.includes("MyPassword123"), rPlain2);
+
 // ── 12. 明文审计（防止备份副本把密钥带上云）
 {
   const { auditForPlaintext, looksCredentialFile } = await import("./backup.mjs");

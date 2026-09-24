@@ -200,7 +200,11 @@ export function redactSensitive(relPath, buf, opts = {}) {
   const aggressive = opts.aggressive !== false;
   const base = relPath.split("/").pop() ?? "";
 
-  const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|api[-_]?key|auth|cookie|session|bearer|private/i;
+  const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|api[-_]?key|auth(?!or)|cookie|session[-_]?(token|key|secret|id)|bearer|private/i;
+  // 密钥引用（$ENV / !cmd / dpapi: / file:）是“密钥放在哪”的指针，不是秘密本身，应保留
+  const SECRET_REF_SCHEMES = ["$", "!", "dpapi:", "file:"];
+  const isRef = (v) =>
+    typeof v === "string" && SECRET_REF_SCHEMES.some((p) => v.trim().startsWith(p));
   // 常见凭据前缀，以及“长且像随机串”的值
   const SECRET_VALUE_RE =
     /^(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|[A-Za-z0-9_+/=-]{32,})$/;
@@ -214,8 +218,15 @@ export function redactSensitive(relPath, buf, opts = {}) {
         const out = {};
         for (const [k, val] of Object.entries(v)) {
           if (SECRET_KEY_RE.test(k)) {
-            // 保留结构，抹掉值
-            out[k] = typeof val === "object" && val !== null ? walk(val, k) : "__REDACTED__";
+            // 保留结构，抹掉值。
+            // 只替换字符串：布尔/数字不可能是凭据，
+            // 把 false 替换成字符串会破坏恢复后的配置语义（回归：includeSessions 曾被误伤）
+            out[k] =
+              typeof val === "object" && val !== null
+                ? walk(val, k)
+                : typeof val === "string"
+                  ? "__REDACTED__"
+                  : val;
           } else {
             out[k] = walk(val, k);
           }
@@ -236,10 +247,6 @@ export function redactSensitive(relPath, buf, opts = {}) {
   if (base.startsWith("auth.json")) {
     try {
       const obj = JSON.parse(buf.toString("utf8"));
-      const SECRET_REF_SCHEMES = ["$", "!", "dpapi:", "file:"];
-      const isRef = (v) =>
-        typeof v === "string" && SECRET_REF_SCHEMES.some((p) => v.trim().startsWith(p));
-
       const walkCredential = (cred) => {
         if (!cred || typeof cred !== "object") return redactJson(cred, { aggressiveValues: aggressive });
         const out = {};
@@ -270,7 +277,11 @@ export function redactSensitive(relPath, buf, opts = {}) {
     try {
       const obj = JSON.parse(buf.toString("utf8"));
       const cleaned = redactJson(obj, { aggressiveValues: false });
-      if (obj.encryptKey) cleaned.encryptKey = "__REDACTED__";
+      // 与 auth.json 同一约定：密钥引用保留（指针非秘密），
+      // 明文由字段名规则抹掉，这里只需把被误抹的引用还原
+      if (typeof obj.encryptKey === "string" && isRef(obj.encryptKey)) cleaned.encryptKey = obj.encryptKey;
+      const pw = obj.remote && typeof obj.remote === "object" ? obj.remote.password : undefined;
+      if (typeof pw === "string" && isRef(pw) && cleaned.remote) cleaned.remote.password = pw;
       return Buffer.from(JSON.stringify(cleaned, null, 2), "utf8");
     } catch {
       return buf;

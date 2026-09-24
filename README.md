@@ -326,7 +326,7 @@ npm test
 node extensions/webdav-backup/verify-load.mjs
 ```
 
-6 个测试文件、277 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
+6 个测试文件、284 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
 
 | 文件 | 覆盖 |
 |---|---|
