@@ -334,7 +334,7 @@ node extensions/webdav-backup/verify-load.mjs
 |---|---|
 | `test.mjs` | 收集/排除、归档、加密往返、快照增量、prune |
 | `test-cli.mjs` | 真实子进程调用 CLI、退出备份、DPAPI 端到端、doctor、日志、状态 |
-| `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护 |
+| `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护、302 重定向（对象存储）恢复 |
 | `test-redact.mjs` | 脱敏（含「字段名无关但值是密钥」的回归用例） |
 | `test-json.mjs` | CLI 输出 JSON 解析容错（回归：空输出曾抛裸 JSON 错误吞掉 stderr） |
 | `test-empty-cmd.mjs` | 空参数/子命令解析、输出契约（回归：`/backup` 不带参数曾报「未知命令：」、完成提醒拿不到 JSON 汇总） |
@@ -356,4 +356,5 @@ node extensions/webdav-backup/verify-load.mjs
 | 想立刻看到日志 | `/backup-log` |
 | DPAPI 解密失败 | 密文只能在本机本用户下解；换机器/换用户需重新 `/backup keys set` |
 | 提示「环境变量未设置」 | `/backup keys set` 改用 dpapi，或先设好该环境变量 |
+| 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.0.3+ |
 | 配置体检 | `/backup verify` 一次看全部状态 |

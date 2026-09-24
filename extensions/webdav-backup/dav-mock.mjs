@@ -1,24 +1,36 @@
 /**
  * dav-mock.mjs — 内存 WebDAV 服务端（供测试使用）
  * 支持 PROPFIND / MKCOL / PUT / GET / HEAD / DELETE + Basic Auth
+ *
+ * 可选：
+ *   requireAuth: false    不校验认证（用于模拟对象存储）
+ *   redirectGetsTo        所有 GET 都 302 到该地址 + 原路径
+ *                         （模拟 Cloudreve/群晖把下载重定向到对象存储）
  */
 
 import http from "node:http";
 
-export function startDavServer({ username = "user", password = "pass" } = {}) {
+export function startDavServer({
+  username = "user",
+  password = "pass",
+  requireAuth = true,
+  redirectGetsTo = null,
+} = {}) {
   /** @type {Map<string, Buffer>} */
   const store = new Map();
   const dirs = new Set(["/"]);
   const expectedAuth = "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
   let putCount = 0;
   let getCount = 0;
+  let lastAuth = null;
 
   const server = http.createServer((req, res) => {
     const path = decodeURIComponent((req.url ?? "/").split("?")[0]);
     const key = path.replace(/\/+$/, "") || "/";
     const method = (req.method ?? "GET").toUpperCase();
+    lastAuth = req.headers.authorization ?? null;
 
-    if (req.headers.authorization !== expectedAuth) {
+    if (requireAuth && req.headers.authorization !== expectedAuth) {
       res.writeHead(401, { "WWW-Authenticate": 'Basic realm="dav"' });
       res.end("unauthorized");
       return;
@@ -94,6 +106,12 @@ export function startDavServer({ username = "user", password = "pass" } = {}) {
     }
 
     if (method === "GET") {
+      // 网盘行为：下载不在 WebDAV 侧，302 到对象存储的带签名临时 URL
+      if (redirectGetsTo) {
+        res.writeHead(302, { Location: `${redirectGetsTo}${path}` });
+        res.end();
+        return;
+      }
       if (!store.has(key)) {
         res.writeHead(404).end();
         return;
@@ -135,6 +153,9 @@ export function startDavServer({ username = "user", password = "pass" } = {}) {
         store,
         dirs,
         stats: () => ({ putCount, getCount }),
+        get lastAuth() {
+          return lastAuth;
+        },
         reset: () => {
           putCount = 0;
           getCount = 0;

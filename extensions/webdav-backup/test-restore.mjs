@@ -196,6 +196,73 @@ async function main() {
   check("默认恢复到临时目录", r6.ok === true && r6.dest.includes("pi-restore-"), String(r6.dest));
   check("未覆盖原文件", readFileSync(join(agentDir, "settings.json"), "utf8") === beforeSettings);
 
+  // 10. 服务端把 GET 302 到另一台主机（对象存储）时，恢复仍要成功
+  //     —— Cloudreve / 群晖等网盘的真实行为：下载地址是带签名的临时 URL。
+  //     回归：客户端曾不跟随重定向，恢复报「下载 xxx 失败：HTTP 302」。
+  {
+    const objStore = await startDavServer({ requireAuth: false });
+    const front = await startDavServer({ redirectGetsTo: `http://127.0.0.1:${objStore.port}` });
+    front.dirs.add("/dav");
+    try {
+      const redirAgentDir = mkdtempSync(join(tmpdir(), "pi-redirect-test-"));
+      writeFileSync(join(redirAgentDir, "settings.json"), '{"theme":"nord"}\n');
+      writeFileSync(
+        join(redirAgentDir, "webdav-backup.json"),
+        JSON.stringify({
+          remote: {
+            url: `http://127.0.0.1:${front.port}/dav`,
+            username: "user",
+            password: "pass",
+            remoteDir: "bk",
+            remoteName: "pi-redir",
+          },
+          encrypt: false,
+          includeSessions: false,
+        }),
+      );
+
+      process.env.PI_CODING_AGENT_DIR = redirAgentDir;
+      const redirConfig = loadConfig().config;
+
+      // 备份走的是 WebDAV 本体（PUT 不重定向）
+      const rb = await runBackup(redirConfig, {
+        log: () => {},
+        agentDir: redirAgentDir,
+        stateFile: join(redirAgentDir, "state.json"),
+      });
+      check("重定向场景下备份成功", rb.ok === true, rb.error);
+
+      // 把归档搬到对象存储侧（模拟网盘内部的 COS 副本）；
+      // front 的 key 带 url 路径前缀（/dav/bk/...），重定向后路径与之保持一致
+      const uploads = [...front.store.keys()].filter((k) => k.includes(`/${redirConfig.remoteDir}/`));
+      check("远端有归档文件", uploads.length > 0, JSON.stringify([...front.store.keys()]));
+      for (const k of uploads) objStore.store.set(k, front.store.get(k));
+
+      const redirDest = join(redirAgentDir, "restored-redirect");
+      let rr = null;
+      let err = "";
+      try {
+        rr = await restoreBackup(redirConfig, { agentDir: redirAgentDir, to: redirDest, log: () => {} });
+      } catch (e) {
+        err = String(e.message);
+      }
+      check("302 重定向后仍能恢复", rr?.ok === true, err || JSON.stringify(rr?.error));
+      check("重定向恢复出 settings.json", existsSync(join(redirDest, "settings.json")));
+      check(
+        "重定向恢复内容一致",
+        existsSync(join(redirDest, "settings.json")) &&
+          readFileSync(join(redirDest, "settings.json"), "utf8") === '{"theme":"nord"}\n',
+      );
+      // 跨主机重定向时不能把 WebDAV 凭据带给对象存储
+      check("不向重定向目标泄露凭据", objStore.lastAuth === null, String(objStore.lastAuth));
+
+      rmSync(redirAgentDir, { recursive: true, force: true });
+    } finally {
+      front.server.close();
+      objStore.server.close();
+    }
+  }
+
   dav.server.close();
   try {
     rmSync(agentDir, { recursive: true, force: true });

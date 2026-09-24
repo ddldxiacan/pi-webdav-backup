@@ -3,6 +3,11 @@
  *
  * 支持：MKCOL、PUT、GET、DELETE、PROPFIND、HEAD
  * 认证：Basic Auth / Digest 不实现（WebDAV 主流服务用 Basic + TLS 或应用密码）
+ *
+ * 重定向：GET/HEAD 的 301/302/303/307/308 会自动跟随（最多 MAX_REDIRECTS 跳）。
+ *   Cloudreve 等网盘把 GET 重定向到对象存储（如腾讯云 COS）的带签名临时 URL，
+ *   不跟随就会拿到 302 而恢复失败。跳到其他主机时会丢弃 Authorization 头，
+ *   避免把 WebDAV 凭据泄露给对象存储。
  */
 
 import http from "node:http";
@@ -10,8 +15,9 @@ import https from "node:https";
 import { URL } from "node:url";
 
 const UA = "pi-webdav-backup/1.0";
+const MAX_REDIRECTS = 5;
 
-function request(url, { method, headers = {}, body = null, timeoutMs = 60000, insecureTls = false }) {
+function request(url, { method, headers = {}, body = null, timeoutMs = 60000, insecureTls = false, redirects = MAX_REDIRECTS }) {
   return new Promise((resolve, reject) => {
     let u;
     try {
@@ -36,11 +42,42 @@ function request(url, { method, headers = {}, body = null, timeoutMs = 60000, in
     if (isHttps && insecureTls) opts.rejectUnauthorized = false;
 
     const req = lib.request(opts, (res) => {
+      const status = res.statusCode ?? 0;
+      const location = res.headers.location;
+      const isRedirect = [301, 302, 303, 307, 308].includes(status);
+
+      // 跟随重定向（仅 GET/HEAD；PUT/DELETE/PROPFIND 不跟随，避免意外丢方法体）
+      if (isRedirect && location && redirects > 0 && (method === "GET" || method === "HEAD")) {
+        res.resume(); // 丢弃重定向响应体，释放连接
+        let next;
+        try {
+          next = new URL(location, url);
+        } catch (e) {
+          reject(new Error(`${method} ${url} 重定向地址非法: ${location} (${e.message})`));
+          return;
+        }
+        // 跨主机重定向到对象存储时，不能把 WebDAV 凭据带过去
+        const nextHeaders = { ...headers };
+        const nextPort = Number(next.port || (next.protocol === "https:" ? 443 : 80));
+        if (next.hostname !== u.hostname || nextPort !== Number(opts.port)) delete nextHeaders.Authorization;
+        // 303 语义：后续一律 GET
+        const nextMethod = status === 303 ? "GET" : method;
+        request(next.toString(), {
+          method: nextMethod,
+          headers: nextHeaders,
+          body: null,
+          timeoutMs,
+          insecureTls,
+          redirects: redirects - 1,
+        }).then(resolve, reject);
+        return;
+      }
+
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         resolve({
-          status: res.statusCode ?? 0,
+          status,
           headers: res.headers,
           body: Buffer.concat(chunks),
         });
@@ -138,7 +175,10 @@ export class WebDAVClient {
     const res = await this.#req("GET", remotePath);
     if (res.status === 200) return res.body;
     if (res.status === 404) return null;
-    throw new Error(`下载 ${remotePath} 失败：HTTP ${res.status}`);
+    const hint = [301, 302, 303, 307, 308].includes(res.status)
+      ? "（服务端要求重定向到对象存储，可能跳转次数超限）"
+      : "";
+    throw new Error(`下载 ${remotePath} 失败：HTTP ${res.status}${hint}`);
   }
 
   async stat(remotePath) {
