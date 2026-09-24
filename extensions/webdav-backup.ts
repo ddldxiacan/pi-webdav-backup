@@ -33,6 +33,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseCliJson } from "./webdav-backup/json.mjs";
 
 // bundler/jiti 下 import.meta.url 可能不可用，做兜底
 const EXT_DIR = (() => {
@@ -245,8 +246,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       // ── 体检：报告密钥来源与明文告警
       if (sub === "verify") {
         const r = await runCli(["doctor", "--json"], ctx, { timeoutMs: 60_000 });
-        const line = r.stdout.trim().split("\n").pop() ?? "{}";
-        const d = JSON.parse(line) as {
+        const d = parseCliJson(r) as {
           ok?: boolean;
           url?: string;
           username?: string;
@@ -279,8 +279,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
 
         if (action === "list") {
           const r = await runCli(["list-secrets", "--json"], ctx, { timeoutMs: 60_000 });
-          const line = r.stdout.trim().split("\n").pop() ?? "{}";
-          const d = JSON.parse(line) as {
+          const d = parseCliJson(r) as {
             available?: boolean;
             secrets?: { name: string; updatedAt?: string }[];
           };
@@ -399,8 +398,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       if (sub === "restore") {
         const autoYes = /(^|\s)(-y|--yes)(\s|$)/.test(args);
         const listRun = await runCli(["restore", "--list", "--json"], ctx, { timeoutMs: 60_000 });
-        const raw = listRun.stdout.trim().split("\n").pop() ?? "{}";
-        const listing = JSON.parse(raw) as {
+        const listing = parseCliJson(listRun) as {
           archives?: { name: string; size: number }[];
           snapshot?: { name: string; fileCount: number } | null;
         };
@@ -451,8 +449,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
 
       // status/list/check 用 JSON 结果做友好展示
       if (sub === "status") {
-        const line = r.stdout.trim().split("\n").pop() ?? "{}";
-        const parsed = JSON.parse(line) as { state?: BackupState };
+        const parsed = parseCliJson(r) as { state?: BackupState };
         ctx.ui.notify(
           parsed.state?.lastBackupAt
             ? `上次备份：${new Date(parsed.state.lastBackupAt).toLocaleString()}（${parsed.state.lastReason ?? "?"}）`
@@ -463,8 +460,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       }
 
       if (sub === "check" || sub === "list") {
-        const line = r.stdout.trim().split("\n").pop() ?? "{}";
-        const parsed = JSON.parse(line) as {
+        const parsed = parseCliJson(r) as {
           ok?: boolean;
           error?: string;
           status?: number;

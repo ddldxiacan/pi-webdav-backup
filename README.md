@@ -326,7 +326,7 @@ npm test
 node extensions/webdav-backup/verify-load.mjs
 ```
 
-6 个测试文件、284 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
+7 个测试文件、292 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
 
 | 文件 | 覆盖 |
 |---|---|
@@ -334,6 +334,7 @@ node extensions/webdav-backup/verify-load.mjs
 | `test-cli.mjs` | 真实子进程调用 CLI、退出备份、DPAPI 端到端、doctor、日志、状态 |
 | `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护 |
 | `test-redact.mjs` | 脱敏（含「字段名无关但值是密钥」的回归用例） |
+| `test-json.mjs` | CLI 输出 JSON 解析容错（回归：空输出曾抛裸 JSON 错误吞掉 stderr） |
 | `test-secrets.mjs` | dpapi/$ENV/file/!命令/plain 各分支、明文告警、三种迁移方式 |
 | `test-auth-migrate.mjs` | `auth.json` 明文密钥审计与迁移（迁移前自动备份、可回滚） |
 
