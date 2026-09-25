@@ -70,7 +70,7 @@ pi install /path/to/pi-webdav-backup       # 本地目录（下载 ZIP 解压后
 | `/backup restore` | 交互选择备份并恢复到临时目录 |
 | `/backup verify` | 配置体检：密钥来源、明文告警、连接性 |
 | `/backup plugins` | 插件体检：已声明的插件是否装齐（含缺失依赖） |
-| `/backup repair-plugins` | 补装缺失的插件 / 依赖（`npm install`） |
+| `/backup repair-plugins` | 补装缺失的插件 / 依赖（`npm install` / `git clone`） |
 | `/backup keys list` | 列出已加密保存的密钥 |
 | `/backup keys set <名称>` | 用 DPAPI 加密保存密钥 |
 | `/backup keys rm <名称>` | 删除密钥 |
@@ -88,8 +88,8 @@ node ~/.pi/agent/extensions/webdav-backup/cli.mjs doctor --json
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs migrate --method dpapi
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --list
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\restore
-node ~/.pi/agent/extensions/webdav-backup/cli.mjs plugins --json
-node ~/.pi/agent/extensions/webdav-backup/cli.mjs repair-plugins --dry-run
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs plugins --json [--dir D:\pi-restore]
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs repair-plugins --dry-run [--dir D:\pi-restore]
 ```
 
 输出末行固定是 JSON 汇总（`--json` 时只输出该行，人类模式则前面还有日志行），脚本可直接解析；退出码 0 成功 / 1 失败。
@@ -199,7 +199,9 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 /backup repair-plugins   # 补装（git 缺失则 clone，依赖缺失则 npm install）
 ```
 
-`/backup restore` 完成后会自动体检并询问是否补装；也可随时手动执行。
+`/backup restore` 完成后会自动体检**刚恢复出来的目录**并询问是否补装（恢复默认解到临时目录，
+所以体检的是那个临时目录，而不是当前 `~/.pi/agent`）；也会顺带看一眼正在用的 agent 目录。
+拷贝到 `~/.pi/agent` 后仍可随时手动执行 `/backup plugins` / `/backup repair-plugins`。
 
 > 不想恢复后重建？把 `node_modules` 备份进去需要改代码（`DEFAULT_EXCLUDE` 是内置的，
 > 配置里的 `exclude` 只能追加、不能移除），而且会带来两个问题：体积暴涨（本例单个 git 包
@@ -337,22 +339,29 @@ node cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\pi-restore
 
 ### 恢复后把插件装回来
 
-插件声明与源码会随备份回来，但**插件实现代码 `node_modules` 不备份**。恢复到 `~/.pi/agent` 后跑：
+插件声明与源码会随备份回来，但**插件实现代码 `node_modules` 不备份**。恢复后跑（`--dir` 指向
+刚恢复出来的目录，不加则看当前 `~/.pi/agent`）：
 
 ```
 /backup plugins          # 看哪些插件没装好
 /backup repair-plugins   # 补装
+
+node cli.mjs plugins --json --dir D:\pi-restore        # 命令行同理
+node cli.mjs repair-plugins --dir D:\pi-restore
 ```
 
-会做的事：
+会做的事（安装命令与 pi 自身的安装逻辑保持一致）：
 
 | 情况 | 动作 |
 |---|---|
-| npm 包装在 `settings.json` 里、但 `npm/node_modules` 里没有 | `npm install <包>[@版本]`（在 `~/.pi/agent/npm`） |
-| git 包目录不存在 | `git clone --depth 1 [--branch <ref>]` |
-| git 包目录在、但缺依赖 | 在该包目录内 `npm install` |
+| npm 包装在 `settings.json` 里、但 `npm/node_modules` 里没有 | `npm install <包>[@版本] --legacy-peer-deps`（在 `<目录>/npm`） |
+| git 包目录不存在 | `git clone --depth 1 [--branch <ref>]`；ref 不是分支/标签（如 commit SHA）时自动回退为完整 clone + `git checkout` |
+| git 包目录在、但缺依赖（逐个依赖名检测，拷了一半也能查出来） | 在该包目录内 `npm install --omit=dev` |
 
 `--dry-run` 只列将执行的命令，不落盘；单个包失败不影响其余，结果里会分开报 `repaired` / `failed`。
+
+> 来源解析与 pi 的 `parseGitUrl` 完全对齐：支持 `git:` 简写、`https://…` URL、`git@host:path` scp 形式，
+> ref 可含 `/`（如 `feature/x`），`.git` 后缀自动去掉（否则会装到 pi 找不到的目录）。
 
 > `/backup restore` 恢复完会自动体检并询问是否立即补装（`/backup restore -y` 会略过询问）。
 
@@ -378,14 +387,14 @@ npm test
 node extensions/webdav-backup/verify-load.mjs
 ```
 
-8 个测试文件、310 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
+9 个测试文件、373 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
 
 | 文件 | 覆盖 |
 |---|---|
 | `test.mjs` | 收集/排除、归档、加密往返、快照增量、prune |
 | `test-cli.mjs` | 真实子进程调用 CLI、退出备份、DPAPI 端到端、doctor、日志、状态 |
 | `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护、302 重定向（对象存储）恢复 |
-| `test-plugins.mjs` | 插件声明解析、恢复后体检（缺安装/缺依赖）、补装、dry-run、真实恢复往返 |
+| `test-plugins.mjs` | 插件声明解析（与 pi 官方 parseGitUrl 对齐：`.git` 后缀、ref 含 `/`、URL/scp 来源）、恢复后体检（缺安装/逐个依赖查缺依赖）、补装、SHA ref 回退、dry-run、真实恢复往返 |
 | `test-redact.mjs` | 脱敏（含「字段名无关但值是密钥」的回归用例） |
 | `test-json.mjs` | CLI 输出 JSON 解析容错（回归：空输出曾抛裸 JSON 错误吞掉 stderr） |
 | `test-empty-cmd.mjs` | 空参数/子命令解析、输出契约（回归：`/backup` 不带参数曾报「未知命令：」、完成提醒拿不到 JSON 汇总） |

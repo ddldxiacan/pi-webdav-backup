@@ -161,6 +161,34 @@ function fmtSize(n: number): string {
   return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
 }
 
+/**
+ * 体检并（在用户同意时）补装插件。
+ * dir 指向要体检的目录——恢复流程里必须传「刚恢复出来的目录」：
+ * 恢复默认解到临时目录，声明还在那里，看当前 agent 目录会永远报“没声明插件”。
+ */
+async function repairPluginsFlow(
+  ctx: ExtensionCommandContext,
+  dir: string | null,
+  note: string,
+): Promise<void> {
+  const dirArgs = dir ? ["--dir", dir] : [];
+  const pl = await runCli(["plugins", "--json", ...dirArgs], ctx, { timeoutMs: 60_000 });
+  const pa = parseCliJson(pl) as { issues?: { source: string }[] } | null;
+  if (!pa?.issues?.length) return;
+  const names = pa.issues.map((i) => i.source).join("、");
+  const fix = await ctx.ui.confirm(
+    "插件未安装完整",
+    `检测到 ${pa.issues.length} 个已声明但未装好的插件：\n${names}\n\n${note}\n\n现在补装吗？`,
+  );
+  if (!fix) return;
+  ctx.ui.setStatus("webdav-backup", "补装插件中…");
+  const rp = await runCli(["repair-plugins", "--json", ...dirArgs], ctx, { timeoutMs: 30 * 60 * 1000 });
+  ctx.ui.setStatus("webdav-backup", undefined);
+  const pr = parseCliJson(rp) as { repaired?: unknown[]; failed?: unknown[] } | null;
+  if (rp.ok) ctx.ui.notify(`插件补装完成（${pr?.repaired?.length ?? 0} 个）`, "info");
+  else ctx.ui.notify(`插件补装未全部成功（失败 ${pr?.failed?.length ?? 0} 个）`, "warning");
+}
+
 export default function webdavBackupExtension(pi: ExtensionAPI) {
   // ---------------------------------------------------------------- 退出自动备份
   pi.on("session_shutdown", async (event, ctx) => {
@@ -446,25 +474,21 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         }
         if (rr.ok && info.ok) {
           ctx.ui.notify(`恢复完成：${info.files} 个文件 → ${info.dest}`, "info");
-          // 恢复到的是一份配置快照，插件实现代码（node_modules）有意不在备份里；
-          // 这里顺带体检一下当前 agent 目录，提醒用户补装，避免插件静默带病运行。
-          const pl = await runCli(["plugins", "--json"], ctx, { timeoutMs: 60_000 });
-          const pa = parseCliJson(pl) as { issues?: { source: string }[] };
-          if (pa?.issues?.length) {
-            const names = pa.issues.map((i) => i.source).join("、");
-            const fix = await ctx.ui.confirm(
-              "插件未安装完整",
-              `检测到 ${pa.issues.length} 个已声明但未装好的插件：\n${names}\n\n插件实现代码不在备份里（node_modules 被有意排除），现在补装吗？`,
-            );
-            if (fix) {
-              ctx.ui.setStatus("webdav-backup", "补装插件中…");
-              const rp = await runCli(["repair-plugins", "--json"], ctx, { timeoutMs: 30 * 60 * 1000 });
-              ctx.ui.setStatus("webdav-backup", undefined);
-              const pr = parseCliJson(rp) as { repaired?: unknown[]; failed?: unknown[] };
-              if (rp.ok) ctx.ui.notify(`插件补装完成（${pr?.repaired?.length ?? 0} 个）`, "info");
-              else ctx.ui.notify(`插件补装未全部成功（失败 ${pr?.failed?.length ?? 0} 个）`, "warning");
-            }
-          }
+          // 恢复出来的是一份配置快照，插件实现代码（node_modules）有意不在备份里，
+          // 所以恢复后必然缺安装/缺依赖。体检要针对「刚恢复出来的目录」（--dir），
+          // 而不是当前 agent 目录：恢复默认解到临时目录，声明还在临时目录里，
+          // 看当前目录会永远报“没声明插件”，补装提示根本不会出现。
+          await repairPluginsFlow(
+            ctx,
+            info.dest ?? null,
+            `插件实现代码不在备份里（node_modules 被有意排除）。补装会装进恢复目录：${info.dest}\n装完把这些文件拷到 ~/.pi/agent 即可直接使用。`,
+          );
+          // 用户可能已经把恢复出来的文件拷进 ~/.pi/agent，顺带再看一眼正在用的目录
+          await repairPluginsFlow(
+            ctx,
+            null,
+            "插件实现代码不在备份里（node_modules 被有意排除）。这台机器正在用的 agent 目录里，声明的插件没装齐。",
+          );
         } else {
           ctx.ui.notify(`恢复失败：${info.error || rr.stderr.trim() || `退出码 ${rr.code}`}`, "error");
         }

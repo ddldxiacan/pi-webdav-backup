@@ -15,9 +15,73 @@
  * 零依赖，只用 Node 内置模块。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+
+/**
+ * 解析 git 仓库来源（与 pi 的 parseGitUrl / splitRef 语义对齐）：
+ *   - ref 从路径部分的第一个 "@" 切开（ref 可含 "/"，如 feature/x）
+ *   - 去掉结尾 ".git"（pi 的安装路径也去掉，不一致会装到 pi 找不到的目录）
+ *   - 支持 scp 形式 git@host:path、显式协议 URL、git: 简写 host/path
+ * 返回 { host, path, ref, url } 或 null。
+ */
+export function parseGitRepo(raw) {
+  let repo = String(raw).trim();
+  let ref = null;
+  let host = "";
+  let path = "";
+
+  const scp = repo.match(/^git@([^:]+):(.+)$/);
+  const isUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(repo);
+
+  if (scp) {
+    const body = scp[2];
+    const i = body.indexOf("@");
+    if (i > 0) {
+      ref = body.slice(i + 1);
+      repo = `git@${scp[1]}:${body.slice(0, i)}`;
+    }
+    host = scp[1];
+    path = i > 0 ? body.slice(0, i) : body;
+  } else if (isUrl) {
+    try {
+      const u = new URL(repo);
+      const p = u.pathname.replace(/^\/+/, "");
+      const i = p.indexOf("@");
+      if (i > 0) {
+        ref = p.slice(i + 1);
+        u.pathname = `/${p.slice(0, i)}`;
+        repo = u.toString().replace(/\/$/, "");
+        path = p.slice(0, i);
+      } else {
+        path = p;
+      }
+      host = u.hostname;
+    } catch {
+      return null;
+    }
+  } else {
+    // git: 简写 host/path[@ref]
+    const slash = repo.indexOf("/");
+    if (slash <= 0) return null;
+    host = repo.slice(0, slash);
+    const rest = repo.slice(slash + 1);
+    const i = rest.indexOf("@");
+    if (i > 0) {
+      ref = rest.slice(i + 1);
+      path = rest.slice(0, i);
+    } else {
+      path = rest;
+    }
+    repo = `https://${host}/${path}`;
+  }
+
+  // pi 的 buildGitSource：去掉结尾 .git，路径至少两段（user/project）
+  path = String(path).replace(/\.git$/, "").replace(/^\/+|\/+$/g, "");
+  if (!host || path.split("/").filter(Boolean).length < 2) return null;
+  return { host, path, ref: ref || null, url: repo };
+}
 
 /**
  * 解析 settings.json 里的一条 package 声明。
@@ -28,7 +92,7 @@ export function parsePackageSource(source) {
   if (!s) return null;
 
   if (s.startsWith("npm:")) {
-    const spec = s.slice(4);
+    const spec = s.slice(4).trim();
     // 兼容 @scope/name@version 与 name@version
     const at = spec.lastIndexOf("@");
     const hasVersion = at > 0;
@@ -41,23 +105,15 @@ export function parsePackageSource(source) {
   }
 
   if (s.startsWith("git:")) {
-    let rest = s.slice(4);
-    let ref = null;
-    const at = rest.lastIndexOf("@");
-    if (at > 0 && !rest.slice(at + 1).includes("/")) {
-      ref = rest.slice(at + 1);
-      rest = rest.slice(0, at);
-    }
-    const slash = rest.indexOf("/");
-    if (slash <= 0) return null;
-    return {
-      type: "git",
-      source: s,
-      host: rest.slice(0, slash),
-      path: rest.slice(slash + 1),
-      ref,
-      url: `https://${rest}`,
-    };
+    const parsed = parseGitRepo(s.slice(4).trim());
+    if (parsed) return { type: "git", source: s, ...parsed };
+    return { type: "local", source: s, path: s };
+  }
+
+  // 显式协议 URL / scp 形式：与 pi 一致，都算 git 来源
+  if (/^(https?|ssh|git):\/\//i.test(s) || /^git@[^:]+:.+$/.test(s)) {
+    const parsed = parseGitRepo(s);
+    if (parsed) return { type: "git", source: s, ...parsed };
   }
 
   // 本地路径：不做安装，仅记录
@@ -92,17 +148,29 @@ export function installPathFor(agentDir, pkg) {
   return null;
 }
 
-/** 读包目录里的 package.json，返回 dependencies 数量 */
+/** 读包目录里的 package.json，返回 { deps, optional }（依赖名列表）；无法读取返回 null */
 function readDeps(pkgDir) {
   const file = join(pkgDir, "package.json");
   if (!existsSync(file)) return null;
   try {
     const pkg = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
-    const deps = { ...(pkg.dependencies ?? {}), ...(pkg.optionalDependencies ?? {}) };
-    return { count: Object.keys(deps).length };
+    return {
+      deps: Object.keys(pkg.dependencies ?? {}),
+      optional: Object.keys(pkg.optionalDependencies ?? {}),
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * 缺依赖检测：逐个依赖名查 node_modules（同 pi 的 hasMissingGitDependencies），
+ * 只看 dependencies。只判断 node_modules 目录存在会漏掉「拷了一半」的情况。
+ * 返回缺失的依赖名数组；无法判断时返回 null。
+ */
+function missingDeps(pkgDir, depNames) {
+  if (!depNames) return null;
+  return depNames.filter((name) => !existsSync(join(pkgDir, "node_modules", ...String(name).split("/"))));
 }
 
 /**
@@ -130,8 +198,9 @@ export function analyzePlugins(agentDir) {
 
     // 目录在：检查依赖是否齐（git 包尤其常见——源码恢复了，node_modules 没恢复）
     const deps = readDeps(dir);
-    if (deps && deps.count > 0 && !existsSync(join(dir, "node_modules"))) {
-      const detail = `缺少依赖：声明了 ${deps.count} 个 dependencies，但 ${join(dir, "node_modules")} 不存在`;
+    const missing = missingDeps(dir, deps?.deps ?? null);
+    if (missing && missing.length > 0) {
+      const detail = `缺少依赖：${missing.slice(0, 3).join("、")}${missing.length > 3 ? ` 等 ${missing.length} 个` : ""}`;
       packages.push({ source: pkg.source, type: pkg.type, status: "missing-deps", detail, path: dir });
       issues.push({ source: pkg.source, type: pkg.type, kind: "missing-deps", detail, path: dir });
       continue;
@@ -143,16 +212,26 @@ export function analyzePlugins(agentDir) {
   return { ok: issues.length === 0, packages, issues };
 }
 
+/**
+ * Windows 下 spawnSync(..., shell: true) 会把参数原样拼进 cmd /c，
+ * 含空格的路径（用户名带空格等）会被拆开，必须自己加引号。
+ */
+function quoteArg(a) {
+  const s = String(a);
+  return /[\s"^&|<>()%!]/.test(s) ? `"${s.replace(/"/g, '\"')}"` : s;
+}
+
 /** 默认执行器：返回 {ok, error}，不抛异常。带超时，避免网络卡死时挂住 UI */
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
 function defaultRun(command, args, cwd, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  const res = spawnSync(command, args, {
+  const useShell = process.platform === "win32";
+  const res = spawnSync(command, useShell ? args.map(quoteArg) : args, {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     encoding: "utf8",
-    shell: process.platform === "win32",
+    shell: useShell,
     timeout: timeoutMs,
     killSignal: "SIGKILL",
   });
@@ -214,7 +293,9 @@ export function repairPlugins(agentDir, opts = {}) {
         continue;
       }
       if (!existsSync(npmDir)) ensureNpmProject(npmDir);
-      const r = run("npm", ["install", spec, "--no-fund", "--no-audit"], npmDir);
+      // --legacy-peer-deps 与 pi 一致：不要自动装宿主提供的 @earendil-works/pi-* peer，
+      // 否则装出来的陈旧 peer 会挡住 pi 的更新
+      const r = run("npm", ["install", spec, "--legacy-peer-deps", "--no-fund", "--no-audit"], npmDir);
       if (r.ok) repaired.push({ source: issue.source, action: `npm install ${spec}` });
       else failed.push({ source: issue.source, error: r.error });
       continue;
@@ -225,30 +306,49 @@ export function repairPlugins(agentDir, opts = {}) {
       const needsClone = issue.kind === "missing-install";
 
       if (needsClone) {
-        const args = ["clone", "--depth", "1"];
-        if (pkg.ref) args.push("--branch", pkg.ref);
-        args.push(pkg.url, dir);
+        // 先走快路径：浅克隆 + --branch（分支 / 标签）。
+        // commit SHA 之类的 ref --branch 认不了，失败时回退成 pi 的做法：完整 clone + checkout。
+        const shallowArgs = ["clone", "--depth", "1"];
+        if (pkg.ref) shallowArgs.push("--branch", pkg.ref);
+        shallowArgs.push(pkg.url, dir);
         log(`克隆 git 插件 ${pkg.url}${pkg.ref ? `@${pkg.ref}` : ""} …`);
         if (dryRun) {
-          skipped.push({ source: issue.source, reason: `dry-run：将执行 git ${args.join(" ")}` });
+          skipped.push({ source: issue.source, reason: `dry-run：将执行 git ${shallowArgs.join(" ")}` });
           continue;
         }
-        const r = run("git", args, agentDir);
+        let r = run("git", shallowArgs, agentDir);
+        if (!r.ok && pkg.ref) {
+          log(`浅克隆失败（ref=${pkg.ref} 可能不是分支/标签），回退为完整克隆 + checkout …`);
+          try {
+            rmSync(dir, { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
+          r = run("git", ["clone", pkg.url, dir], agentDir);
+          if (r.ok) r = run("git", ["checkout", pkg.ref], dir);
+        }
         if (!r.ok) {
+          try {
+            rmSync(dir, { recursive: true, force: true });
+          } catch {
+            /* ignore */
+          }
           failed.push({ source: issue.source, error: r.error });
           continue;
         }
       }
 
-      // 克隆完 / 目录已在，都检查依赖
+      // 克隆完 / 目录已在，都检查依赖（逐个依赖名查 node_modules，同 pi）
       const deps = readDeps(dir);
-      if (deps && deps.count > 0 && !existsSync(join(dir, "node_modules"))) {
-        log(`安装 ${pkg.path} 的依赖 …`);
+      const missing = missingDeps(dir, deps?.deps ?? null);
+      if (missing && missing.length > 0) {
+        log(`安装 ${pkg.path} 的依赖（${missing.length} 个缺失）…`);
         if (dryRun) {
           skipped.push({ source: issue.source, reason: `dry-run：将执行 npm install（在 ${dir}）` });
           continue;
         }
-        const r = run("npm", ["install", "--no-fund", "--no-audit"], dir);
+        // --omit=dev 与 pi 一致：只装运行时依赖
+        const r = run("npm", ["install", "--omit=dev", "--no-fund", "--no-audit"], dir);
         if (!r.ok) {
           failed.push({ source: issue.source, error: r.error });
           continue;

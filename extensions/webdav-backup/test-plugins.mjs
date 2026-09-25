@@ -52,9 +52,10 @@ function makeRunStub({ failOn = [] } = {}) {
       const nodeModules = join(cwd, "node_modules");
       mkdirSync(nodeModules, { recursive: true });
       writeFileSync(join(nodeModules, ".stub"), "1");
-      // `npm install <name>[@ver]` 会落地 node_modules/<name>，体检才能转 ok
-      const spec = args[1];
-      if (spec && spec !== "install") {
+      // `npm install <name>[@ver]` 会落地 node_modules/<name>，体检才能转 ok；
+      // 无 spec 的 `npm install`（装依赖）只建 node_modules
+      const spec = args.slice(1).find((a) => !a.startsWith("-") && a !== "install");
+      if (spec) {
         const at = spec.lastIndexOf("@");
         const name = at > 0 ? spec.slice(0, at) : spec;
         const pkgDir = join(nodeModules, ...name.split("/"));
@@ -93,6 +94,27 @@ async function main() {
   );
   const gitPlain = parsePackageSource("git:github.com/example/pi-tools");
   check("解析 git 无 ref", gitPlain.ref === null, JSON.stringify(gitPlain));
+  // 与 pi 对齐的解析细节
+  const gitDot = parsePackageSource("git:github.com/example/pi-tools.git@v1");
+  check(
+    "git 去掉 .git 后缀（安装路径与 pi 一致）",
+    gitDot.path === "example/pi-tools" && gitDot.ref === "v1" && gitDot.host === "github.com",
+    JSON.stringify(gitDot),
+  );
+  const gitSlashRef = parsePackageSource("git:github.com/example/pi-tools@feature/x");
+  check("git ref 可含斜杠", gitSlashRef.ref === "feature/x" && gitSlashRef.path === "example/pi-tools", JSON.stringify(gitSlashRef));
+  const gitUrl = parsePackageSource("https://github.com/example/pi-tools@v1");
+  check(
+    "https URL 也识别为 git",
+    gitUrl.type === "git" && gitUrl.host === "github.com" && gitUrl.path === "example/pi-tools" && gitUrl.ref === "v1",
+    JSON.stringify(gitUrl),
+  );
+  const gitScp = parsePackageSource("git:git@github.com:example/pi-tools.git");
+  check(
+    "scp 形式识别为 git",
+    gitScp.type === "git" && gitScp.host === "github.com" && gitScp.path === "example/pi-tools",
+    JSON.stringify(gitScp),
+  );
   check("解析 local", parsePackageSource("./pi-tools").type === "local");
   check("空声明返回 null", parsePackageSource("") === null && parsePackageSource(null) === null);
 
@@ -158,7 +180,7 @@ async function main() {
     const r = repairPlugins(d3, { run });
     check("npm 补装成功", r.ok === true && r.repaired.length === 1, JSON.stringify(r));
     const install = calls.find((c) => c.command === "npm");
-    check("npm 命令带版本号", install && install.args.join(" ") === "install pi-footer@1.2.3 --no-fund --no-audit", JSON.stringify(install));
+    check("npm 命令带版本号", install && install.args.join(" ") === "install pi-footer@1.2.3 --legacy-peer-deps --no-fund --no-audit", JSON.stringify(install));
     check("npm 在 agentDir/npm 下执行", install && install.cwd === join(d3, "npm"), install?.cwd);
     check("复检已通过", analyzePlugins(d3).ok === true);
   }
@@ -180,10 +202,47 @@ async function main() {
     check("clone 带 --depth 1", clone && clone.args.includes("--depth") && clone.args.includes("1"), JSON.stringify(clone));
     check("clone 带 ref（--branch）", clone && clone.args.includes("--branch") && clone.args.includes("v1"), JSON.stringify(clone));
     check("clone 用 https url", clone && clone.args.some((x) => String(x).startsWith("https://github.com/example/missing-git")), JSON.stringify(clone));
-    // deps-git：应在其目录内跑 npm install
+    // deps-git：应在其目录内跑 npm install（只装运行时依赖，同 pi）
     const npmInGit = calls.find((c) => c.command === "npm" && c.cwd === depsGit4);
     check("git 缺依赖 → 在包目录内 npm install", !!npmInGit, JSON.stringify(calls.map((c) => ({ c: c.command, cwd: c.cwd }))));
+    check("git 依赖用 --omit=dev", npmInGit && npmInGit.args.includes("--omit=dev"), JSON.stringify(npmInGit));
     check("两个 git 包都算已修复", r.repaired.length === 2, JSON.stringify(r));
+  }
+
+  // ── 5b. git ref 用 commit SHA 时 --branch 不认，应回退为完整 clone + checkout
+  {
+    const d8 = mkdtempSync(join(tmpdir(), "pi-plugins-test8-"));
+    writeFileSync(join(d8, "settings.json"), JSON.stringify({ packages: ["git:github.com/example/sha-git@0123abc"] }));
+    const { run, calls } = makeRunStub({ failOn: ["--branch"] });
+    const r = repairPlugins(d8, { run });
+    check("SHA ref 回退后仍修复成功", r.ok === true && r.repaired.length === 1, JSON.stringify(r));
+    check("回退为完整 clone", calls.some((c) => c.command === "git" && c.args[0] === "clone" && !c.args.includes("--depth")), JSON.stringify(calls));
+    check("回退后执行 checkout", calls.some((c) => c.command === "git" && c.args[0] === "checkout" && c.args[1] === "0123abc"), JSON.stringify(calls));
+    try {
+      rmSync(d8, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── 5c. node_modules 在但缺了个别依赖（拷了一半）→ 仍应报 missing-deps
+  {
+    const d9 = mkdtempSync(join(tmpdir(), "pi-plugins-test9-"));
+    const pkgDir = join(d9, "git", "github.com", "example", "half-git");
+    mkdirSync(join(pkgDir, "node_modules", "a"), { recursive: true });
+    writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name: "h", dependencies: { a: "^1", b: "^1" } }));
+    writeFileSync(join(d9, "settings.json"), JSON.stringify({ packages: ["git:github.com/example/half-git"] }));
+    const a9 = analyzePlugins(d9);
+    check("node_modules 半残也能查出来", a9.issues.length === 1 && a9.issues[0].kind === "missing-deps", JSON.stringify(a9.issues));
+    check("缺依赖点名到具体包", String(a9.issues[0].detail).includes("b"), JSON.stringify(a9.issues[0]));
+    const { run, calls } = makeRunStub();
+    const r9 = repairPlugins(d9, { run });
+    check("半残状态只补依赖不重新 clone", r9.ok === true && !calls.some((c) => c.command === "git"), JSON.stringify(calls));
+    try {
+      rmSync(d9, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   }
 
   // ── 6. 单个包失败不影响其余；dry-run 不落盘
@@ -273,7 +332,7 @@ async function main() {
     const { run, calls } = makeRunStub();
     const repaired = repairPlugins(dest, { run });
     check("恢复后补装成功", repaired.ok === true && repaired.repaired.length === 1, JSON.stringify(repaired));
-    check("补装命令正确", calls[0]?.args.join(" ") === "install pi-footer@1.2.3 --no-fund --no-audit", JSON.stringify(calls[0]));
+    check("补装命令正确", calls[0]?.args.join(" ") === "install pi-footer@1.2.3 --legacy-peer-deps --no-fund --no-audit", JSON.stringify(calls[0]));
     check("补装后体检通过", analyzePlugins(dest).ok === true);
 
     dav.server.close();
