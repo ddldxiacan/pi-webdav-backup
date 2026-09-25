@@ -1,6 +1,6 @@
 {
   "name": "pi-webdav-backup",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "pi 配置自动备份到 WebDAV（坚果云 / Nextcloud / 群晖 / 自建）：归档与快照两种模式、AES-256-GCM 加密、DPAPI 密钥管理、敏感字段脱敏、退出自动备份与每日定时备份。",
   "keywords": [
     "pi-package",

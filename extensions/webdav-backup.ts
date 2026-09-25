@@ -207,6 +207,8 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         "status",
         "restore",
         "verify",
+        "plugins",
+        "repair-plugins",
         "keys",
         "help",
       ];
@@ -229,6 +231,8 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
             "/backup restore 查看可恢复的备份列表",
             "                （/backup restore -y 恢复到临时目录）",
             "/backup verify  配置体检（密钥来源 / 明文告警 / 连接性）",
+            "/backup plugins 体检已声明插件是否装齐（含缺失依赖）",
+            "/backup repair-plugins 补装缺失的插件 / 依赖",
             "/backup keys    管理密钥（列表 / 设置 / 删除 / 迁移明文）",
           ].join("\n"),
           "info",
@@ -442,6 +446,25 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         }
         if (rr.ok && info.ok) {
           ctx.ui.notify(`恢复完成：${info.files} 个文件 → ${info.dest}`, "info");
+          // 恢复到的是一份配置快照，插件实现代码（node_modules）有意不在备份里；
+          // 这里顺带体检一下当前 agent 目录，提醒用户补装，避免插件静默带病运行。
+          const pl = await runCli(["plugins", "--json"], ctx, { timeoutMs: 60_000 });
+          const pa = parseCliJson(pl) as { issues?: { source: string }[] };
+          if (pa?.issues?.length) {
+            const names = pa.issues.map((i) => i.source).join("、");
+            const fix = await ctx.ui.confirm(
+              "插件未安装完整",
+              `检测到 ${pa.issues.length} 个已声明但未装好的插件：\n${names}\n\n插件实现代码不在备份里（node_modules 被有意排除），现在补装吗？`,
+            );
+            if (fix) {
+              ctx.ui.setStatus("webdav-backup", "补装插件中…");
+              const rp = await runCli(["repair-plugins", "--json"], ctx, { timeoutMs: 30 * 60 * 1000 });
+              ctx.ui.setStatus("webdav-backup", undefined);
+              const pr = parseCliJson(rp) as { repaired?: unknown[]; failed?: unknown[] };
+              if (rp.ok) ctx.ui.notify(`插件补装完成（${pr?.repaired?.length ?? 0} 个）`, "info");
+              else ctx.ui.notify(`插件补装未全部成功（失败 ${pr?.failed?.length ?? 0} 个）`, "warning");
+            }
+          }
         } else {
           ctx.ui.notify(`恢复失败：${info.error || rr.stderr.trim() || `退出码 ${rr.code}`}`, "error");
         }

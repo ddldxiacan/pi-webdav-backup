@@ -69,6 +69,8 @@ pi install /path/to/pi-webdav-backup       # 本地目录（下载 ZIP 解压后
 | `/backup prune` | 清理旧备份（保留 `keepVersions` 个） |
 | `/backup restore` | 交互选择备份并恢复到临时目录 |
 | `/backup verify` | 配置体检：密钥来源、明文告警、连接性 |
+| `/backup plugins` | 插件体检：已声明的插件是否装齐（含缺失依赖） |
+| `/backup repair-plugins` | 补装缺失的插件 / 依赖（`npm install`） |
 | `/backup keys list` | 列出已加密保存的密钥 |
 | `/backup keys set <名称>` | 用 DPAPI 加密保存密钥 |
 | `/backup keys rm <名称>` | 删除密钥 |
@@ -86,6 +88,8 @@ node ~/.pi/agent/extensions/webdav-backup/cli.mjs doctor --json
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs migrate --method dpapi
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --list
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\restore
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs plugins --json
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs repair-plugins --dry-run
 ```
 
 输出末行固定是 JSON 汇总（`--json` 时只输出该行，人类模式则前面还有日志行），脚本可直接解析；退出码 0 成功 / 1 失败。
@@ -175,6 +179,31 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 | `**/*.log` | 日志 |
 
 包含：`extensions/`（你写的扩展）、`models.json`、`models-store.json`、`settings.json`、`trust.json`、`auth.json`、`npm/package.json` 等。
+
+### 插件（install 装的包）会怎样
+
+**声明与源码都会备份，但插件实现代码（`node_modules`）不备份** —— 它体积大、含平台相关二进制，而 lockfile 足以重建。
+
+| 插件类型 | 备份里有什么 | 恢复后 |
+|---|---|---|
+| `git:` | 包源码（`git/**`，含浅克隆 `.git`） | 源码在；但包自己的 `node_modules` 不在，需补装依赖 |
+| `npm:` | 仅声明（`npm/package.json` + `package-lock.json`） | 代码全不在，需重新 `npm install` |
+
+因此**恢复后插件不会自动就位**，需要补装。pi 本身只在“git 包目录完全不存在”时才重装；
+目录在、只是缺 `node_modules` 时它不会补，插件会静默带病运行（有运行时依赖的包会报错）。
+
+用这两条命令善后：
+
+```
+/backup plugins          # 体检：哪些已声明插件没装好
+/backup repair-plugins   # 补装（git 缺失则 clone，依赖缺失则 npm install）
+```
+
+`/backup restore` 完成后会自动体检并询问是否补装；也可随时手动执行。
+
+> 不想恢复后重建？把 `node_modules` 备份进去需要改代码（`DEFAULT_EXCLUDE` 是内置的，
+> 配置里的 `exclude` 只能追加、不能移除），而且会带来两个问题：体积暴涨（本例单个 git 包
+> 就 131MB）、跨平台时会带上不兼容的原生二进制。所以推荐「瘦备份 + 恢复后补装」这套流程。
 
 ### 敏感文件脱敏（重要）
 
@@ -306,6 +335,27 @@ copy "$env:TEMP\pi-restore-XXXX\restored\extensions\*.ts" "$env:USERPROFILE\.pi\
 node cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\pi-restore
 ```
 
+### 恢复后把插件装回来
+
+插件声明与源码会随备份回来，但**插件实现代码 `node_modules` 不备份**。恢复到 `~/.pi/agent` 后跑：
+
+```
+/backup plugins          # 看哪些插件没装好
+/backup repair-plugins   # 补装
+```
+
+会做的事：
+
+| 情况 | 动作 |
+|---|---|
+| npm 包装在 `settings.json` 里、但 `npm/node_modules` 里没有 | `npm install <包>[@版本]`（在 `~/.pi/agent/npm`） |
+| git 包目录不存在 | `git clone --depth 1 [--branch <ref>]` |
+| git 包目录在、但缺依赖 | 在该包目录内 `npm install` |
+
+`--dry-run` 只列将执行的命令，不落盘；单个包失败不影响其余，结果里会分开报 `repaired` / `failed`。
+
+> `/backup restore` 恢复完会自动体检并询问是否立即补装（`/backup restore -y` 会略过询问）。
+
 ### 加密备份的恢复
 
 需要 `encryptKey` 一致（配置文件或 `$PI_WEBDAV_BACKUP_KEY`）。密钥不对会明确报错，不会写出损坏文件。
@@ -335,6 +385,7 @@ node extensions/webdav-backup/verify-load.mjs
 | `test.mjs` | 收集/排除、归档、加密往返、快照增量、prune |
 | `test-cli.mjs` | 真实子进程调用 CLI、退出备份、DPAPI 端到端、doctor、日志、状态 |
 | `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护、302 重定向（对象存储）恢复 |
+| `test-plugins.mjs` | 插件声明解析、恢复后体检（缺安装/缺依赖）、补装、dry-run、真实恢复往返 |
 | `test-redact.mjs` | 脱敏（含「字段名无关但值是密钥」的回归用例） |
 | `test-json.mjs` | CLI 输出 JSON 解析容错（回归：空输出曾抛裸 JSON 错误吞掉 stderr） |
 | `test-empty-cmd.mjs` | 空参数/子命令解析、输出契约（回归：`/backup` 不带参数曾报「未知命令：」、完成提醒拿不到 JSON 汇总） |
@@ -357,4 +408,5 @@ node extensions/webdav-backup/verify-load.mjs
 | DPAPI 解密失败 | 密文只能在本机本用户下解；换机器/换用户需重新 `/backup keys set` |
 | 提示「环境变量未设置」 | `/backup keys set` 改用 dpapi，或先设好该环境变量 |
 | 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.0.3+ |
+| 恢复后插件不生效 | 插件代码（`node_modules`）有意不入备份。跑 `/backup plugins` 看哪些没装好，再 `/backup repair-plugins` 补装 |
 | 配置体检 | `/backup verify` 一次看全部状态 |

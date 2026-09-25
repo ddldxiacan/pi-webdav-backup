@@ -8,6 +8,8 @@
  *   node cli.mjs list   [--json]          列出远端已有备份
  *   node cli.mjs prune  [--keep N]        清理旧备份
  *   node cli.mjs restore [--file 名称] [--to 目录] [--list] [--json]   恢复备份
+ *   node cli.mjs plugins [--json]              体检：恢复后哪些插件需要补装
+ *   node cli.mjs repair-plugins [--dry-run]    补装缺失的插件 / 依赖（npm install）
  *   node cli.mjs set-secret --name webdav-password [--value X]  用 DPAPI 加密保存密钥
  *   node cli.mjs list-secrets [--json]      列出已存的 DPAPI 密钥（不含明文）
  *   node cli.mjs rm-secret --name X         删除 DPAPI 密钥
@@ -158,6 +160,40 @@ async function main() {
     else if (r.message) logTo(r.message);
     if (r.warnings?.length) for (const w of r.warnings) logTo(`警告：${w}`);
     return finish(r, r.ok ? 0 : 1);
+  }
+
+  // ── 插件修复（不需要 WebDAV 配置）
+  if (cmd === "plugins" || cmd === "repair-plugins") {
+    const mod = await import("./packages.mjs");
+    if (cmd === "plugins") {
+      const a = mod.analyzePlugins(agentDir);
+      if (!asJson) {
+        if (a.packages.length === 0) logTo("settings.json 里没有声明任何插件。");
+        else {
+          logTo(`共 ${a.packages.length} 个已声明插件：`);
+          for (const p of a.packages) {
+            const mark = p.status === "ok" ? "✅" : p.status === "skip" ? "➖" : "⚠️";
+            logTo(`  ${mark} ${p.source}${p.status === "ok" || p.status === "skip" ? "" : ` — ${p.detail}`}`);
+          }
+        }
+        if (a.issues.length) logTo(`\n有 ${a.issues.length} 个插件需要补装，运行 /backup repair-plugins 修复。`);
+      }
+      finish({ ok: a.ok, ...a }, a.ok ? 0 : 1);
+      return;
+    }
+
+    const r = mod.repairPlugins(agentDir, { log: logTo, dryRun: has("--dry-run") });
+    if (!asJson) {
+      if (r.repaired.length === 0 && r.failed.length === 0 && r.skipped.length === 0) {
+        logTo("所有插件都已安装完整，无需修复。");
+      } else {
+        for (const x of r.repaired) logTo(`  ✅ ${x.source} — ${x.action}`);
+        for (const x of r.skipped) logTo(`  ➖ ${x.source} — ${x.reason}`);
+        for (const x of r.failed) logTo(`  ❌ ${x.source} — ${x.error}`);
+      }
+    }
+    finish({ ok: r.ok, repaired: r.repaired, failed: r.failed, skipped: r.skipped }, r.ok ? 0 : 1);
+    return;
   }
 
   const loaded = loadConfig();
