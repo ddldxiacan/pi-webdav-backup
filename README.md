@@ -11,7 +11,13 @@
 一行命令（pi 官方包机制）：
 
 ```bash
-pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0   # 钉住具体 tag（推荐）
+pi install git:github.com/ddldxiacan/pi-webdav-backup@v1        # 永远装最新的 1.x 正式版
+```
+
+`@v1` 是**移动主版本 tag**，始终指向最新的 1.x 正式版。以后升级不用改命令：
+
+```bash
+pi update --extensions     # 自动升到最新的 v1.x（然后 /reload）
 ```
 
 只想试一下、不安装（仅本次运行生效）：
@@ -20,16 +26,19 @@ pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0   # 钉住具体 ta
 pi -e git:github.com/ddldxiacan/pi-webdav-backup
 ```
 
-其他方式：
+其他方式 / 更细的版本控制：
 
 ```bash
-pi install npm:pi-webdav-backup            # 已发布到 npm 时
-pi install /path/to/pi-webdav-backup       # 本地目录（下载 ZIP 解压后）
+pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0   # 钉死某个版本（不自动升级）
+pi install git:github.com/ddldxiacan/pi-webdav-backup          # 不钉 ref，直接跟 main 分支
+pi install npm:pi-webdav-backup                                # 已发布到 npm 时
+pi install /path/to/pi-webdav-backup                           # 本地目录（下载 ZIP 解压后）
 ```
 
-> ⚠️ `@<ref>` 里的 ref 必须真实存在（tag / 分支 / commit SHA）。更新到新版也是同一条命令换个 tag，
-> 例如 `pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0` —— 钉死的 ref 不会被
-> `pi update --extensions` 自动挪走。
+> `@<ref>` 可以是移动 tag（`@v1`）、具体版本 tag（`@v1.1.0`）、分支或 commit SHA：
+> - `@v1` → `pi update --extensions` 会跟到最新的 1.x，**推荐**
+> - `@v1.1.0` / commit SHA → 钉死不动；升级需重新 `pi install ...@<新版本>`
+> - ref 必须真实存在，写错（如不存在的 tag）会 clone/checkout 失败
 
 手动安装：把 `extensions/webdav-backup.ts` 与 `extensions/webdav-backup/` 拷到 `~/.pi/agent/extensions/`。
 
@@ -426,6 +435,9 @@ node extensions/webdav-backup/verify-load.mjs
 |---|---|
 | **v1.1.0** | **插件备份/恢复修好**：恢复后自动体检「恢复出来的目录」并补装（此前看错目录，补装提示永不出现）；`plugins`/`repair-plugins` 新增 `--dir`；git 来源解析与 pi 完全对齐（`.git` 后缀、ref 含 `/`、`https://`/scp 形式）；commit SHA ref 自动回退为完整 clone + checkout；缺依赖逐个检测；安装参数对齐 pi（`--legacy-peer-deps` / `--omit=dev`）；Windows 路径含空格不再报错。另含 v1.0.2 之后的修复：恢复遇 302 重定向到对象存储自动跟随（不外泄凭据）、完成通知拿不到汇总的回归 |
 | **v1.0.2** | 初始发布：归档/快照两种备份模式、AES-256-GCM 加密、DPAPI/环境变量/命令密钥、明文脱敏、退出自动备份与每日定时备份、恢复到临时目录 |
+
+> 发新版时：打新 tag（如 `v1.1.1`）后把移动 tag `v1` 一并指过去，让 `pi install …@v1` 始终装最新：
+> `git tag -f v1 v1.1.1 && git push -f origin v1`
 
 ---
 
