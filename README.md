@@ -11,7 +11,7 @@
 一行命令（pi 官方包机制）：
 
 ```bash
-pi install git:github.com/ddldxiacan/pi-webdav-backup@v1
+pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0   # 钉住具体 tag（推荐）
 ```
 
 只想试一下、不安装（仅本次运行生效）：
@@ -26,6 +26,10 @@ pi -e git:github.com/ddldxiacan/pi-webdav-backup
 pi install npm:pi-webdav-backup            # 已发布到 npm 时
 pi install /path/to/pi-webdav-backup       # 本地目录（下载 ZIP 解压后）
 ```
+
+> ⚠️ `@<ref>` 里的 ref 必须真实存在（tag / 分支 / commit SHA）。更新到新版也是同一条命令换个 tag，
+> 例如 `pi install git:github.com/ddldxiacan/pi-webdav-backup@v1.1.0` —— 钉死的 ref 不会被
+> `pi update --extensions` 自动挪走。
 
 手动安装：把 `extensions/webdav-backup.ts` 与 `extensions/webdav-backup/` 拷到 `~/.pi/agent/extensions/`。
 
@@ -67,9 +71,9 @@ pi install /path/to/pi-webdav-backup       # 本地目录（下载 ZIP 解压后
 | `/backup dry` | 试运行：只扫描统计，不上传 |
 | `/backup status` | 查看上次备份时间 |
 | `/backup prune` | 清理旧备份（保留 `keepVersions` 个） |
-| `/backup restore` | 交互选择备份并恢复到临时目录 |
+| `/backup restore` | 交互选择备份并恢复到临时目录；完成后自动体检恢复目录并询问补装插件 |
 | `/backup verify` | 配置体检：密钥来源、明文告警、连接性 |
-| `/backup plugins` | 插件体检：已声明的插件是否装齐（含缺失依赖） |
+| `/backup plugins` | 插件体检：已声明的插件是否装齐（含逐个依赖查缺失） |
 | `/backup repair-plugins` | 补装缺失的插件 / 依赖（`npm install` / `git clone`） |
 | `/backup keys list` | 列出已加密保存的密钥 |
 | `/backup keys set <名称>` | 用 DPAPI 加密保存密钥 |
@@ -323,6 +327,17 @@ node "$env:USERPROFILE\.pi\agent\extensions\webdav-backup\cli.mjs" install-cron 
 
 **默认恢复到临时目录，不会直接覆盖 `~/.pi/agent`** —— 因为恢复旧配置可能覆盖你当前的密钥。
 
+完整流程：
+
+```
+/backup restore
+  ├─ 选备份（`-y` 直接取最新）→ 解压到临时目录
+  ├─ 自动体检【刚恢复出来的目录】→ 插件缺安装/缺依赖时询问是否补装
+  ├─ 把临时目录里需要的文件拷到 ~/.pi/agent
+  └─ 顺带再体检一次正在用的 agent 目录（如果你已拷过去）
+/reload                  # 插件即可用
+```
+
 恢复后自行拷贝需要的文件：
 
 ```powershell
@@ -363,7 +378,9 @@ node cli.mjs repair-plugins --dir D:\pi-restore
 > 来源解析与 pi 的 `parseGitUrl` 完全对齐：支持 `git:` 简写、`https://…` URL、`git@host:path` scp 形式，
 > ref 可含 `/`（如 `feature/x`），`.git` 后缀自动去掉（否则会装到 pi 找不到的目录）。
 
-> `/backup restore` 恢复完会自动体检并询问是否立即补装（`/backup restore -y` 会略过询问）。
+> `/backup restore` 恢复完会自动体检**刚恢复出来的目录**并询问是否立即补装——体检的是临时目录，
+> 不是当前 `~/.pi/agent`（声明还在临时目录里，看错目录会永远报“没声明插件”）。
+> `/backup restore -y` 只略过「恢复哪个 / 是否恢复」的询问，插件补装仍会单独问一次。
 
 ### 加密备份的恢复
 
@@ -403,6 +420,15 @@ node extensions/webdav-backup/verify-load.mjs
 
 ---
 
+## 版本历史
+
+| 版本 | 内容 |
+|---|---|
+| **v1.1.0** | **插件备份/恢复修好**：恢复后自动体检「恢复出来的目录」并补装（此前看错目录，补装提示永不出现）；`plugins`/`repair-plugins` 新增 `--dir`；git 来源解析与 pi 完全对齐（`.git` 后缀、ref 含 `/`、`https://`/scp 形式）；commit SHA ref 自动回退为完整 clone + checkout；缺依赖逐个检测；安装参数对齐 pi（`--legacy-peer-deps` / `--omit=dev`）；Windows 路径含空格不再报错。另含 v1.0.2 之后的修复：恢复遇 302 重定向到对象存储自动跟随（不外泄凭据）、完成通知拿不到汇总的回归 |
+| **v1.0.2** | 初始发布：归档/快照两种备份模式、AES-256-GCM 加密、DPAPI/环境变量/命令密钥、明文脱敏、退出自动备份与每日定时备份、恢复到临时目录 |
+
+---
+
 ## 故障排查
 
 | 现象 | 处理 |
@@ -416,6 +442,8 @@ node extensions/webdav-backup/verify-load.mjs
 | 想立刻看到日志 | `/backup-log` |
 | DPAPI 解密失败 | 密文只能在本机本用户下解；换机器/换用户需重新 `/backup keys set` |
 | 提示「环境变量未设置」 | `/backup keys set` 改用 dpapi，或先设好该环境变量 |
-| 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.0.3+ |
-| 恢复后插件不生效 | 插件代码（`node_modules`）有意不入备份。跑 `/backup plugins` 看哪些没装好，再 `/backup repair-plugins` 补装 |
+| 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.1.0+ |
+| 恢复后插件不生效 | 插件代码（`node_modules`）有意不入备份。`/backup restore` 会自动体检并询问补装；手动用 `/backup plugins` / `/backup repair-plugins`（可带 `--dir` 指向恢复目录）。注意补装需联网 |
+| 补装报 `git clone` 失败 | 确认能访问 github.com 等源；ref 是 commit SHA 时会自动回退为完整 clone + checkout，仍失败则看日志里的 git 输出 |
+| 插件体检一直报「缺少安装」 | 多半是 `.git` 后缀 / ref 形式的声明被装到了 pi 找不到的目录；v1.1.0+ 已与 pi 的解析对齐，升级后跑一次 `/backup repair-plugins` |
 | 配置体检 | `/backup verify` 一次看全部状态 |
