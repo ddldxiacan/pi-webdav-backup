@@ -298,12 +298,56 @@ async function main() {
     rmSync(live2, { recursive: true, force: true });
   }
 
-  // ── 8. mergeSettingsPackages：本机无声明时返回 null（用备份原样）
+  // 8. mergeSettingsPackages：本机无声明时返回 null（用备份原样）
   {
     check("本机无 packages 声明时不合并", mergeSettingsPackages('{"packages":["npm:A"]}', '{"theme":"x"}') === null);
     const m = mergeSettingsPackages('{"packages":["npm:A","npm:B"],"theme":"light"}', '{"packages":["npm:B@2"],"theme":"dark"}');
     const o = JSON.parse(m);
     check("合并保留本机声明优先、追加备份独有", JSON.stringify(o.packages) === JSON.stringify(["npm:B@2", "npm:A"]) && o.theme === "light", String(m));
+  }
+
+  // ── 9. 回归：npm/package.json 必须合并 dependencies（否则 pi 会卸载本机独有插件）
+  {
+    // 备份来源（Windows）：只依赖 A、B
+    const backup = mkdtempSync(join(tmpdir(), "pi-npm-merge-bk-"));
+    mkdirSync(join(backup, "npm"), { recursive: true });
+    writeFileSync(join(backup, "settings.json"), JSON.stringify({ packages: ["npm:A", "npm:B"] }));
+    writeFileSync(
+      join(backup, "npm", "package.json"),
+      JSON.stringify({ name: "pi-extensions", private: true, dependencies: { A: "^1.0.0", B: "^2.0.0" } }),
+    );
+
+    // 目标机器（Linux）：已装 A（本机版本）+ 本机独有的 Z
+    const live = mkdtempSync(join(tmpdir(), "pi-npm-merge-live-"));
+    mkdirSync(join(live, "npm"), { recursive: true });
+    writeFileSync(join(live, "settings.json"), JSON.stringify({ packages: ["npm:A@9", "npm:Z"] }));
+    writeFileSync(
+      join(live, "npm", "package.json"),
+      JSON.stringify({ name: "pi-extensions", private: true, dependencies: { A: "^9.0.0", Z: "^0.1.0" } }),
+    );
+
+    const r = applyRestoredFiles(backup, live, { merge: true });
+    const deps = JSON.parse(readFileSync(join(live, "npm", "package.json"), "utf8")).dependencies;
+    check("merge 后 npm 依赖保留本机 A@9", deps.A === "^9.0.0", JSON.stringify(deps));
+    check("merge 后 npm 依赖保留本机独有 Z", deps.Z === "^0.1.0", JSON.stringify(deps));
+    check("merge 后 npm 依赖追加备份独有的 B", deps.B === "^2.0.0", JSON.stringify(deps));
+    check("merged 列表标出 npm-dependencies", r.merged?.some((m) => m.kind === "npm-dependencies"), JSON.stringify(r.merged));
+
+    // replace：完全用备份版（Z 会从 package.json 消失，由 pi 下次启动自行卸载）
+    const live2 = mkdtempSync(join(tmpdir(), "pi-npm-merge-live2-"));
+    mkdirSync(join(live2, "npm"), { recursive: true });
+    writeFileSync(join(live2, "settings.json"), JSON.stringify({ packages: ["npm:A@9", "npm:Z"] }));
+    writeFileSync(
+      join(live2, "npm", "package.json"),
+      JSON.stringify({ name: "pi-extensions", private: true, dependencies: { A: "^9.0.0", Z: "^0.1.0" } }),
+    );
+    applyRestoredFiles(backup, live2, { merge: false });
+    const deps2 = JSON.parse(readFileSync(join(live2, "npm", "package.json"), "utf8")).dependencies;
+    check("replace 后 npm 依赖完全变回备份版", JSON.stringify(deps2) === JSON.stringify({ A: "^1.0.0", B: "^2.0.0" }), JSON.stringify(deps2));
+
+    rmSync(backup, { recursive: true, force: true });
+    rmSync(live, { recursive: true, force: true });
+    rmSync(live2, { recursive: true, force: true });
   }
 
   console.log(lines.join("\n"));

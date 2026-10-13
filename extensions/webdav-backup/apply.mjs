@@ -64,6 +64,11 @@ export function isPluginImplementationPath(rel) {
   return r.startsWith("git/") || r.includes("/node_modules/");
 }
 
+/** agentDir 下的 npm 包清单（决定 pi 启动时 npm 装/卸哪些插件） */
+export function isNpmManifestPath(rel) {
+  return String(rel).replace(/\\/g, "/") === "npm/package.json";
+}
+
 /**
  * 求一个插件实现文件所属的「插件根目录」相对路径，用于判定本机是否已装该插件：
  *   npm/node_modules/foo/lib/x.js       → npm/node_modules/foo
@@ -145,6 +150,46 @@ export function mergeSettingsPackages(backupText, localText) {
   return JSON.stringify({ ...backup, packages: [...localPkgs, ...extra] }, null, 2);
 }
 
+/**
+ * 合并 npm/package.json 的 dependencies：本机已有优先（保留版本），追加备份里本机没有的。
+ *
+ * 为何必须合并：pi 启动时会拿 npm/package.json 与 node_modules 做协调（npm install）。
+ * 若 merge 写回时用备份版直接覆盖，本机独有的插件会被 npm 当成多余包【卸载】。
+ * 返回合并后的 JSON 文本；无可合并时返回 null（调用方按普通逻辑处理）。
+ */
+export function mergeNpmDependencies(backupText, localText) {
+  let backup;
+  let local;
+  try {
+    backup = JSON.parse(String(backupText).replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+  try {
+    local = JSON.parse(String(localText).replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+  if (!backup || typeof backup !== "object") return null;
+
+  const backupDeps = backup.dependencies && typeof backup.dependencies === "object" ? backup.dependencies : {};
+  const localDeps = local?.dependencies && typeof local.dependencies === "object" ? local.dependencies : {};
+  if (Object.keys(localDeps).length === 0) return null;
+
+  // 本机已声明的依赖保留本机版本；备份独有的追加进来
+  const merged = { ...localDeps };
+  let added = 0;
+  for (const [name, range] of Object.entries(backupDeps)) {
+    if (!(name in merged)) {
+      merged[name] = range;
+      added++;
+    }
+  }
+  // 本机声明已包含备份全部依赖且无新增 → 无需改写
+  if (added === 0 && Object.keys(merged).length === Object.keys(localDeps).length) return null;
+  return JSON.stringify({ ...backup, dependencies: merged }, null, 2);
+}
+
 /** 递归列出恢复目录下、应写回 agentDir 的文件（跳过 extra/ 与元数据） */
 export function listRestoredFiles(restoredDir, { extraPrefix = "extra/" } = {}) {
   const root = resolve(restoredDir);
@@ -224,6 +269,21 @@ export function applyRestoredFiles(restoredDir, agentDir, opts = {}) {
       }
     }
 
+    // merge：npm/package.json 只合并 dependencies，保留本机独有插件。
+    // 否则覆盖后，pi 下次启动的 npm 协调会把本机独有的包当成多余包卸载。
+    let mergedNpm = false;
+    if (merge && isNpmManifestPath(f.rel) && existsSync(target)) {
+      try {
+        const mergedText = mergeNpmDependencies(srcBuf.toString("utf8"), readFileSync(target, "utf8"));
+        if (mergedText !== null) {
+          srcBuf = Buffer.from(mergedText, "utf8");
+          mergedNpm = true;
+        }
+      } catch {
+        /* 合并失败则退回普通处理 */
+      }
+    }
+
     // merge：本机已装该插件（插件根目录已存在）→ 跳过整个插件，避免降级与版本混合。
     // 但若该文件与本地完全一致，则归为 unchanged（保证重复写回幂等）。
     if (merge) {
@@ -281,11 +341,13 @@ export function applyRestoredFiles(restoredDir, agentDir, opts = {}) {
       let backup = null;
       if (existsSync(target)) backup = backupExisting(target, "apply");
       writeFileSync(target, srcBuf);
-      applied.push({ rel: f.rel, target, backup, merged: mergedSettings });
-      if (mergedSettings) merged.push({ rel: f.rel, target });
+      applied.push({ rel: f.rel, target, backup, merged: mergedSettings || mergedNpm });
+      if (mergedSettings) merged.push({ rel: f.rel, target, kind: "settings-packages" });
+      if (mergedNpm) merged.push({ rel: f.rel, target, kind: "npm-dependencies" });
       log(
         `  ${backup ? "已覆盖" : "已写入"} ${f.rel} → ${target}` +
           (mergedSettings ? "（已合并 packages，保留本机插件声明）" : "") +
+          (mergedNpm ? "（已合并 dependencies，保留本机插件依赖）" : "") +
           (backup ? `（原文件备份为 ${backup}）` : ""),
       );
     } catch (e) {

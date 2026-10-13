@@ -442,10 +442,13 @@ node "$env:USERPROFILE\.pi\agent\extensions\webdav-backup\cli.mjs" install-cron 
 新电脑往往已经装过一些插件——可能和备份里同名但版本不同，也可能多装了备份里没有的。
 直接覆盖会**把同名插件降级、把本机多装的声明抹掉、留下版本混合的“缝合”目录**。所以写回有两种模式：
 
-| 模式 | settings.json 的 packages | 本机已装的插件实现 | 本机多装的插件 |
-|---|---|---|---|
-| **合并**（默认，推荐） | 本机声明优先，追加备份里本机没有的 | **保留本机版本**，不覆盖 | 保留（声明与代码都留） |
-| 替换（旧机原样） | 完全用备份版 | 被备份覆盖（同名降级） | 声明被移除（代码不删） |
+| 模式 | settings.json 的 packages | npm/package.json 的 dependencies | 本机已装的插件实现 | 本机多装的插件 |
+|---|---|---|---|---|
+| **合并**（默认，推荐） | 本机声明优先，追加备份里本机没有的 | 本机依赖优先，追加备份里本机没有的 | **保留本机版本**，不覆盖 | 保留（声明与代码都留） |
+| 替换（旧机原样） | 完全用备份版 | 完全用备份版 | 被备份覆盖（同名降级） | 声明被移除（代码不删） |
+
+> **为何要合并 `npm/package.json`**：pi 启动时会拿它与 `node_modules` 做协调（npm install）。
+> 若直接覆盖成备份版，本机独有的插件会被 npm 当成多余包【卸载】。所以合并模式会保留本机已有依赖。
 
 - 交互式 `/backup restore`：本机有插件声明时会先让你选（默认合并）
 - 命令行：`--mode merge`（默认）/ `--mode replace`
@@ -633,6 +636,7 @@ node extensions/webdav-backup/verify-load.mjs
 
 | 版本 | 内容 |
 |---|---|
+| **v1.3.3** | **修复合并模式会卸载本机插件**：`restore-apply` 合并模式此前只合并 `settings.json`，却用备份版**覆盖** `npm/package.json`——pi 下次启动的 npm 协调会把本机独有插件当成多余包卸载（实测于 Windows→Linux 同步）。现改为同时合并 `npm/package.json` 的 `dependencies`（本机优先），结果里标 `npm-dependencies`。另：文档补充「多机同步」与「跨平台密钥」流程 |
 | **v1.3.2** | **跨平台多机同步**：依赖体检修正（npm 提升到父级的依赖不再误报为缺失，按 Node 模块解析算法沿祖先 `node_modules` 查找）；文档新增「跨平台密钥（多机同步）」与「多机同步（Windows ↔ Linux）」流程，明确多机用 `file:` / `$ENV` 而非 `dpapi:`，并给出常见坑 |
 | **v1.3.1** | 依赖体检误报修正（npm 提升的依赖被当成缺失） |
 | **v1.3.0** | **换机一键还原**：新增 `includePlugins`（把插件实现 `node_modules` 一并备份，重机恢复即可直接用，无需联网重装）；新增 `restore-apply` / `/backup restore-apply`（把恢复结果写回当前 `~/.pi/agent`，覆盖前备份、幂等、防止 `__REDACTED__` 覆盖真值）；**写回默认【合并模式】**：本机已装插件保留不被覆盖、`settings.json` 只合并 `packages`（避免删掉/降级本机插件），可选 `--mode replace` 完全还原；`/backup restore` 默认询问是否写回当前 pi，已含插件时不再提示联网补装；`/backup-setup` 向导新增插件代码选项；脱敏审计跳过第三方插件代码（避免误报）；排除规则重构（`includePlugins` 开关控制 node_modules） |

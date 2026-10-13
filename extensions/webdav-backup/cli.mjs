@@ -246,7 +246,11 @@ async function main() {
       if (!has("--dry-run")) {
         logTo(`已写回 agent 目录：${agentDir}（${mergeMode ? "合并模式" : "替换模式"}）`);
         logTo(`  写入/覆盖 ${r.applied.length} 个，内容一致 ${r.unchanged.length} 个，失败 ${r.failed.length} 个`);
-        if (r.merged?.length) logTo(`  🔀 settings.json 已合并 packages，保留本机已有插件声明`);
+        if (r.merged?.length) {
+          const kinds = r.merged.map((m) => m.kind).filter(Boolean);
+          if (kinds.includes("settings-packages")) logTo(`  🔀 settings.json 已合并 packages，保留本机已有插件声明`);
+          if (kinds.includes("npm-dependencies")) logTo(`  🔀 npm/package.json 已合并 dependencies，保留本机独有插件依赖`);
+        }
         for (const x of r.skipped) logTo(`  ➖ ${x.rel}（${x.reason}）`);
         for (const x of r.failed) logTo(`  ❌ ${x.rel} — ${x.error}`);
         if (pluginReady) logTo("插件实现代码已随备份恢复，无需联网重装。");
