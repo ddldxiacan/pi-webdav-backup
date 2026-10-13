@@ -25,13 +25,16 @@ function stripBom(text) {
   return text.replace(/^\uFEFF/, "");
 }
 
-const DEFAULT_EXCLUDE = [
+/**
+ * 基础排除：这些内容要么是缓存、要么可重建、要么是密钥，任何情况下都不备份。
+ */
+const BASE_EXCLUDE = [
   "tmp/**",
   "web-search-cache/**",
-  "npm/node_modules/**",
   "sessions/**",
   "**/*.log",
-  "**/node_modules/**",
+  // pi 管理的 fd/rg 二进制，换机后会自动重新下载，不值得备份
+  "bin/**",
   // 密钥相关，绝不能进备份
   "secrets/**",
   "secrets.dpapi.json",
@@ -42,6 +45,37 @@ const DEFAULT_EXCLUDE = [
   "**/*.old",
   "**/*.save",
 ];
+
+/**
+ * 插件实现代码的排除规则。
+ *  - 默认（includePlugins: false）：完全排除 node_modules（瘦备份，恢复后靠联网补装）
+ *  - 开启（includePlugins: true）：保留 node_modules，只排除其中运行时用不到、体积大的部分，
+ *    这样换机恢复后插件即可直接使用，无需联网重装。
+ */
+const PLUGIN_EXCLUDE = ["**/node_modules/**", "npm/node_modules/**"];
+const PLUGIN_KEEP_EXCLUDE = [
+  // git 仓库内部数据：运行时不需要，却可能很大、且含平台相关对象
+  "**/.git/**",
+  "**/node_modules/.cache/**",
+  "**/node_modules/.vite/**",
+  "**/node_modules/.turbo/**",
+  "**/node_modules/.bin/**",
+];
+
+/** 按 includePlugins 组装最终排除列表 */
+function buildExclude(userExclude, includePlugins) {
+  const extra = Array.isArray(userExclude) ? userExclude.map(String) : [];
+  const pluginRules = includePlugins ? PLUGIN_KEEP_EXCLUDE : PLUGIN_EXCLUDE;
+  return [...BASE_EXCLUDE, ...pluginRules, ...extra];
+}
+
+function expandTildeValue(p) {
+  const s = String(p ?? "").trim();
+  if (!s) return "";
+  if (s === "~") return homedir();
+  if (s.startsWith("~/") || s.startsWith("~\\")) return join(homedir(), s.slice(2));
+  return s;
+}
 
 /**
  * 读取配置。返回 { ok, config, errors, warnings, raw }
@@ -97,9 +131,14 @@ export function loadConfig() {
     remoteDir: String(remote.remoteDir ?? raw.remoteDir ?? "pi-backup").replace(/^\/+|\/+$/g, ""),
     remoteName: String(remote.remoteName ?? raw.remoteName ?? "pi-agent").trim(),
     scope: Array.isArray(raw.scope) && raw.scope.length > 0 ? raw.scope.map(String) : ["."],
-    exclude: Array.isArray(raw.exclude)
-      ? [...DEFAULT_EXCLUDE, ...raw.exclude.map(String)]
-      : DEFAULT_EXCLUDE,
+    // 是否把插件实现代码（node_modules）一起备份。开启后换机恢复即可直接使用，无需联网重装。
+    includePlugins: raw.includePlugins === true,
+    // agentDir 之外的额外备份路径（绝对路径或 ~/...）。用于把 ~/.pi/settings.json、
+    // ~/.config/rpiv-* 等插件写在 agentDir 之外的数据一并带上。
+    extraScope: Array.isArray(raw.extraScope)
+      ? [...new Set(raw.extraScope.map(expandTildeValue).filter(Boolean))]
+      : [],
+    exclude: buildExclude(raw.exclude, raw.includePlugins === true),
     includeSessions: raw.includeSessions === true,
     snapshot: raw.snapshot === true,
     encrypt: raw.encrypt === true,
@@ -174,8 +213,15 @@ export function configTemplate() {
     },
     _说明_scope: "要备份的路径，相对 ~/.pi/agent",
     scope: ["."],
-    _说明_exclude: "额外排除规则（glob），内置已排除 tmp/、sessions/、缓存、node_modules",
+    _说明_includePlugins:
+      "是否把插件实现代码（node_modules）一起备份。true=换机恢复后插件可直接用、无需联网重装（推荐）；false=瘦备份，恢复后需 /backup repair-plugins 补装",
+    includePlugins: false,
+    _说明_exclude:
+      "额外排除规则（glob）。内置已排除 tmp/、sessions/、缓存、bin/、密钥副本；includePlugins=false 时另排除 node_modules",
     exclude: [],
+    _说明_extraScope:
+      "agentDir 之外的额外备份路径（绝对路径或 ~/...），例如 \"~/.pi/settings.json\"、\"~/.pi/web-search.json\"、\"~/.config/rpiv-todo\"；归档内落在 extra/ 前缀下，恢复时按当前机器的家目录/XDG 锚点重映射（支持换用户名/盘符）",
+    extraScope: [],
     _说明_includeSessions: "是否包含会话历史（可能很大）",
     includeSessions: false,
     _说明_snapshot: "true=逐文件快照上传（增量，可单文件恢复）；false=打包成单个 tar.gz（默认）",

@@ -9,6 +9,7 @@
  *   /backup dry      试运行：只扫描不传
  *   /backup status   查看上次备份状态
  *   /backup restore  列出可恢复的备份；加 -y 直接恢复到临时目录
+ *   /backup apply-extras  把恢复目录里 agentDir 之外的数据（extra/）归位到真实路径
  *   /backup verify   配置体检（密钥来源、明文告警、连接性）
  *   /backup keys     管理密钥：列表 / 设置 / 删除 / 迁移明文
  *
@@ -35,6 +36,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseCliJson } from "./webdav-backup/json.mjs";
 import { pickCommand } from "./webdav-backup/args.mjs";
+import { detectLegacyConfig } from "./webdav-backup/extras.mjs";
 
 // bundler/jiti 下 import.meta.url 可能不可用，做兜底
 const EXT_DIR = (() => {
@@ -58,6 +60,15 @@ function stateFile() {
 }
 function logFile() {
   return join(getAgentDir(), "webdav-backup.log");
+}
+
+/** 探测 agentDir 之外的遗留配置（包一层，便于将来加缓存/容错） */
+function detectLegacyConfigLocal(): { path: string; kind: string; note: string }[] {
+  try {
+    return detectLegacyConfig(getAgentDir());
+  } catch {
+    return [];
+  }
 }
 
 function readJson<T = unknown>(path: string): T | null {
@@ -189,6 +200,140 @@ async function repairPluginsFlow(
   else ctx.ui.notify(`插件补装未全部成功（失败 ${pr?.failed?.length ?? 0} 个）`, "warning");
 }
 
+/**
+ * 恢复后把恢复目录写回当前 agent 目录（换机一键还原）。
+ * 默认【合并模式】：保护本机已装插件（已存在的不被覆盖），settings.json 只合并 packages。
+ * 覆盖前自动备份旧文件；归档里是 __REDACTED__ 而本地有真实值时会跳过。
+ * 返回是否写回成功，以及备份里是否已含插件实现代码。
+ */
+async function applyRestoredFlow(
+  ctx: ExtensionCommandContext,
+  dir: string,
+): Promise<{ applied: boolean; pluginReady: boolean }> {
+  const dry = await runCli(["restore-apply", "--dir", dir, "--dry-run", "--json"], ctx, { timeoutMs: 120_000 });
+  const d = parseCliJson(dry) as {
+    total?: number;
+    applied?: unknown[];
+    unchanged?: unknown[];
+    skipped?: { rel: string; target?: string }[];
+    failed?: unknown[];
+  } | null;
+  const total = d?.total ?? 0;
+  if (total === 0) return { applied: false, pluginReady: false };
+
+  // 本机已装了插件？让用户选合并（默认，保本机）还是完全替换（旧机原样）
+  const curPlugins = countLocalPackages();
+  let mode = "merge";
+  if (curPlugins > 0) {
+    const pick = await ctx.ui.select(
+      `写回当前 pi？本机已装 ${curPlugins} 个插件`,
+      [
+        "合并（推荐）— 保留本机已装插件，只补本机没有的；不删除/不降级本机插件",
+        "替换 — 完全还原成备份里的状态（可能删掉/降级本机插件）",
+      ],
+    );
+    if (!pick) return { applied: false, pluginReady: false };
+    mode = pick.startsWith("替换") ? "replace" : "merge";
+  }
+
+  const modeNote =
+    mode === "merge"
+      ? "合并模式：本机已装的插件实现（node_modules / git）保留不被覆盖；settings.json 只合并 packages，保留本机已有插件声明。"
+      : "替换模式：完全还原成备份里的状态，同名插件会被降级/覆盖，本机多装的插件声明会被移除（不会删插件代码）。";
+  const ok = await ctx.ui.confirm(
+    `写回当前 pi 配置目录（${mode === "merge" ? "合并" : "替换"}）？`,
+    `将把恢复出来的 ${total} 个文件写回：\n${dir}\n→ ${getAgentDir()}\n\n${modeNote}\n` +
+      `已存在且内容不同的文件会先备份为 <名字>.bak-apply-<时间戳>；` +
+      `归档里是 __REDACTED__ 而本地有真实值的文件会被跳过（避免把真密钥覆盖成占位符）。\n\n继续吗？`,
+  );
+  if (!ok) return { applied: false, pluginReady: false };
+
+  ctx.ui.setStatus("webdav-backup", "写回配置中…");
+  const r = await runCli(["restore-apply", "--dir", dir, "--mode", mode, "--json"], ctx, { timeoutMs: 5 * 60 * 1000 });
+  ctx.ui.setStatus("webdav-backup", undefined);
+  const res = parseCliJson(r) as {
+    applied?: unknown[];
+    unchanged?: unknown[];
+    skipped?: { rel: string }[];
+    failed?: unknown[];
+    merged?: unknown[];
+    pluginReady?: boolean;
+  } | null;
+  if (!r.ok) {
+    ctx.ui.notify(`写回未全部成功（失败 ${res?.failed?.length ?? 0} 个）`, "warning");
+    return { applied: false, pluginReady: false };
+  }
+  const skippedN = res?.skipped?.length ?? 0;
+  ctx.ui.notify(
+    `已写回 ${res?.applied?.length ?? 0} 个文件到 ${getAgentDir()}（${mode === "merge" ? "合并" : "替换"}）` +
+      (res?.merged?.length ? "\nsettings.json 已合并 packages，保留本机插件声明" : "") +
+      (skippedN > 0 ? `\n${skippedN} 个因本机已有版本或本地真实值被跳过` : "") +
+      (res?.pluginReady ? "\n插件实现代码已一并恢复，重启 pi 后即可使用。" : ""),
+    skippedN > 0 ? "warning" : "info",
+  );
+  return { applied: true, pluginReady: res?.pluginReady === true };
+}
+
+/** 本机 settings.json 里声明了多少个插件（仅用于写回前的提示） */
+function countLocalPackages(): number {
+  try {
+    const s = readJson<{ packages?: unknown[] }>(join(getAgentDir(), "settings.json"));
+    return Array.isArray(s?.packages) ? s.packages.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 恢复后把 extra/（agentDir 之外的数据）归位到真实路径。
+ * 这些文件默认只解到恢复目录，需用户确认后才写回 ~/.pi/settings.json、~/.config/... 等。
+ */
+async function applyExtrasFlow(ctx: ExtensionCommandContext, dir: string): Promise<void> {
+  const dry = await runCli(["apply-extras", "--dir", dir, "--dry-run", "--json"], ctx, { timeoutMs: 60_000 });
+  const d = parseCliJson(dry) as {
+    applied?: unknown[];
+    skipped?: { rel: string; target?: string }[];
+    unparsed?: { rel: string }[];
+    unmapped?: { rel: string; orig?: string; target?: string }[];
+    failed?: { rel: string; target?: string; error?: string }[];
+    source?: { hostname?: string; platform?: string; home?: string } | null;
+  } | null;
+  const toWrite = (d?.applied?.length ?? 0) + (d?.skipped?.length ?? 0);
+  if (toWrite === 0) return;
+  const srcNote = d?.source
+    ? `来源机器：${d.source.hostname ?? "?"}（${d.source.platform ?? "?"}），home=${d.source.home ?? "?"}\n`
+    : "";
+  const ok = await ctx.ui.confirm(
+    "归位 agentDir 之外的数据？",
+    `恢复目录里有 ${toWrite} 个 agentDir 之外的配置文件（如 ~/.pi/settings.json、~/.config/rpiv-*）：\n` +
+      srcNote +
+      `${(d?.skipped ?? []).slice(0, 5).map((x) => `  ${x.target}`).join("\n")}\n\n` +
+      `将写回真实路径（跨机时会按家目录/XDG 锚点重映射；已存在且内容相同的会跳过）。继续吗？`,
+  );
+  if (!ok) return;
+  ctx.ui.setStatus("webdav-backup", "归位额外数据中…");
+  // 不加 --force：applyExtraFiles 会跳过“本地已有真实值、而归档里是 __REDACTED__”的文件，
+  // 以免把真密钥覆盖成占位符。被跳过的会以告警列出，用户可手动处理。
+  const r = await runCli(["apply-extras", "--dir", dir, "--json"], ctx, { timeoutMs: 60_000 });
+  ctx.ui.setStatus("webdav-backup", undefined);
+  const res = parseCliJson(r) as {
+    applied?: unknown[];
+    failed?: unknown[];
+    skipped?: { rel: string }[];
+    unmapped?: { rel: string }[];
+  } | null;
+  if (r.ok) {
+    const skippedN = res?.skipped?.length ?? 0;
+    const unmappedN = res?.unmapped?.length ?? 0;
+    const extraNote =
+      (skippedN > 0 ? `；${skippedN} 个因本地已有真实值被跳过（避免用 __REDACTED__ 覆盖，如需强制用 /backup apply-extras <目录> --force）` : "") +
+      (unmappedN > 0 ? `；${unmappedN} 个未匹配家目录/XDG 锚点，按原路径归位，请核对` : "");
+    ctx.ui.notify(`已归位 ${res?.applied?.length ?? 0} 个文件${extraNote}`, skippedN > 0 || unmappedN > 0 ? "warning" : "info");
+  } else {
+    ctx.ui.notify(`归位未全部成功（失败 ${res?.failed?.length ?? 0} 个）`, "warning");
+  }
+}
+
 export default function webdavBackupExtension(pi: ExtensionAPI) {
   // ---------------------------------------------------------------- 退出自动备份
   pi.on("session_shutdown", async (event, ctx) => {
@@ -234,6 +379,8 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         "dry",
         "status",
         "restore",
+        "restore-apply",
+        "apply-extras",
         "verify",
         "plugins",
         "repair-plugins",
@@ -257,7 +404,9 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
             "/backup dry     试运行（只扫描不上传）",
             "/backup status  查看上次备份状态",
             "/backup restore 查看可恢复的备份列表",
-            "                （/backup restore -y 恢复到临时目录）",
+            "                （/backup restore -y 恢复到临时目录后询问是否写回当前 pi）",
+            "/backup restore-apply <目录> 写回当前 pi（默认合并，保留本机已装插件）",
+            "/backup apply-extras 把恢复目录里 agentDir 之外的数据归位到真实路径",
             "/backup verify  配置体检（密钥来源 / 明文告警 / 连接性）",
             "/backup plugins 体检已声明插件是否装齐（含缺失依赖）",
             "/backup repair-plugins 补装缺失的插件 / 依赖",
@@ -276,6 +425,26 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         if (yes) {
           await ctx.ui.notify("请运行 /backup-setup 完成配置", "info");
         }
+        return;
+      }
+
+      if (sub === "apply-extras") {
+        const dir = args.trim().split(/\s+/)[1];
+        if (!dir) {
+          ctx.ui.notify("用法：/backup apply-extras <恢复目录>", "warning");
+          return;
+        }
+        await applyExtrasFlow(ctx, dir);
+        return;
+      }
+
+      if (sub === "restore-apply" || sub === "apply-restore") {
+        const dir = args.trim().split(/\s+/)[1];
+        if (!dir) {
+          ctx.ui.notify("用法：/backup restore-apply <恢复目录>（把恢复结果写回当前 agent 目录）", "warning");
+          return;
+        }
+        await applyRestoredFlow(ctx, dir);
         return;
       }
 
@@ -457,7 +626,7 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
           ? true
           : await ctx.ui.confirm(
               "确认恢复？",
-              `将从 ${fileName} 恢复到一个临时目录（不会直接覆盖 ~/.pi/agent）。\n恢复后你可以自行拷贝需要的文件。`,
+              `将从 ${fileName} 恢复文件。\n先解到一个临时目录，之后会询问是否写回当前 pi 配置目录（${getAgentDir()}）。\n写回时覆盖前会自动备份旧文件。`,
             );
         if (!ok) return;
 
@@ -474,21 +643,37 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         }
         if (rr.ok && info.ok) {
           ctx.ui.notify(`恢复完成：${info.files} 个文件 → ${info.dest}`, "info");
-          // 恢复出来的是一份配置快照，插件实现代码（node_modules）有意不在备份里，
-          // 所以恢复后必然缺安装/缺依赖。体检要针对「刚恢复出来的目录」（--dir），
-          // 而不是当前 agent 目录：恢复默认解到临时目录，声明还在临时目录里，
-          // 看当前目录会永远报“没声明插件”，补装提示根本不会出现。
-          await repairPluginsFlow(
-            ctx,
-            info.dest ?? null,
-            `插件实现代码不在备份里（node_modules 被有意排除）。补装会装进恢复目录：${info.dest}\n装完把这些文件拷到 ~/.pi/agent 即可直接使用。`,
-          );
-          // 用户可能已经把恢复出来的文件拷进 ~/.pi/agent，顺带再看一眼正在用的目录
-          await repairPluginsFlow(
-            ctx,
-            null,
-            "插件实现代码不在备份里（node_modules 被有意排除）。这台机器正在用的 agent 目录里，声明的插件没装齐。",
-          );
+          const dest = info.dest;
+          if (!dest) return;
+
+          // 换机一键还原：把恢复结果写回当前 agent 目录（覆盖前自动备份）
+          const applied = await applyRestoredFlow(ctx, dest);
+
+          // agentDir 之外的额外数据（~/.pi/settings.json 等）单独归位
+          const extrasInDest = (info as { extras?: unknown[] }).extras?.length ?? 0;
+          if (extrasInDest > 0) {
+            await applyExtrasFlow(ctx, dest);
+          }
+
+          if (applied.applied) {
+            // 已写回当前目录：只有备份不含插件代码时才需要联网补装
+            if (!applied.pluginReady) {
+              await repairPluginsFlow(
+                ctx,
+                null,
+                "备份里不含插件实现代码（node_modules）。这台机器正在用的 agent 目录里，声明的插件没装齐。",
+              );
+            } else {
+              ctx.ui.notify("配置已全部还原。建议 /reload 或重启 pi 让插件生效。", "info");
+            }
+          } else {
+            // 未写回：针对刚恢复出来的目录体检并补装，用户再自行拷贝
+            await repairPluginsFlow(
+              ctx,
+              dest,
+              `插件实现代码不在备份里（node_modules 被排除）。补装会装进恢复目录：${dest}\n装完把这些文件拷到 ~/.pi/agent 即可直接使用。`,
+            );
+          }
         } else {
           ctx.ui.notify(`恢复失败：${info.error || rr.stderr.trim() || `退出码 ${rr.code}`}`, "error");
         }
@@ -642,6 +827,11 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       const remoteName = await ctx.ui.input("备份名前缀", cur.remoteName ?? "pi-agent");
       if (remoteName === undefined) return;
 
+      const includePlugins = await ctx.ui.confirm(
+        "把插件实现代码一并备份？",
+        "是（推荐）：连同 node_modules 一起备份，换机后恢复即可直接用，无需联网重装。\n体积会明显变大（可能几百 MB）。\n\n否：只备份声明，恢复后用 /backup repair-plugins 联网补装。",
+      );
+
       const includeSessions = await ctx.ui.confirm("包含会话历史？", "会显著增大备份体积（可能几百 MB）");
       const encrypt = await ctx.ui.confirm(
         "加密备份？",
@@ -706,6 +896,25 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
       // 保留已有的引用形式，避免向导把 dpapi: 引用覆盖成空
       const finalPassword = password ? passwordRef : (cur.password ?? "");
 
+      // 探测 agentDir 之外、可能影响插件加载的遗留配置（~/.pi/settings.json 等），
+      // 让用户决定是否一并纳入 extraScope。
+      const existingExtra: string[] = Array.isArray(existing.extraScope)
+        ? (existing.extraScope as string[]).filter((x) => typeof x === "string")
+        : [];
+      let extraScope = existingExtra;
+      const legacy = detectLegacyConfigLocal();
+      if (legacy.length > 0) {
+        const want = await ctx.ui.confirm(
+          "发现 agentDir 之外的配置",
+          `检测到这些文件不在默认备份范围（~/.pi/agent）内：\n${legacy
+            .map((l) => `  ${l.path}`)
+            .join("\n")}\n\n是否把它们一并备份（extraScope）？恢复时可用 /backup apply-extras 归位。`,
+        );
+        if (want) {
+          extraScope = [...new Set([...existingExtra, ...legacy.map((l) => l.path)])];
+        }
+      }
+
       const cfg = {
         _说明: "pi WebDAV 备份配置，由 /backup-setup 生成",
         enabled: existing.enabled !== false,
@@ -718,6 +927,8 @@ export default function webdavBackupExtension(pi: ExtensionAPI) {
         },
         scope: ["."],
         exclude: [],
+        extraScope,
+        includePlugins,
         includeSessions,
         snapshot: existing.snapshot === true,
         encrypt,

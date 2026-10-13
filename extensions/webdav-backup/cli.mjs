@@ -10,6 +10,9 @@
  *   node cli.mjs restore [--file 名称] [--to 目录] [--list] [--json]   恢复备份
  *   node cli.mjs plugins [--dir 目录] [--json]   体检：恢复后哪些插件需要补装
  *   node cli.mjs repair-plugins [--dir 目录] [--dry-run]  补装缺失的插件 / 依赖（npm install）
+ *   node cli.mjs apply-extras --dir 恢复目录 [--dry-run] [--force]  把 extra/ 数据归位到真实路径
+ *   node cli.mjs restore-apply --dir 恢复目录 [--dry-run] [--force] [--mode merge|replace] [--json]  把恢复结果写回当前 agent 目录
+ *   node cli.mjs detect-legacy [--json]     探测 agentDir 之外的遗留配置（~/.pi/settings.json 等）
  *   node cli.mjs set-secret --name webdav-password [--value X]  用 DPAPI 加密保存密钥
  *   node cli.mjs list-secrets [--json]      列出已存的 DPAPI 密钥（不含明文）
  *   node cli.mjs rm-secret --name X         删除 DPAPI 密钥
@@ -31,6 +34,8 @@ import { join } from "node:path";
 import { loadConfig, configPath, statePath, logPath, resolveAgentDir } from "./config.mjs";
 import { runBackup, pruneOldArchives, readState } from "./backup.mjs";
 import { WebDAVClient } from "./webdav.mjs";
+import { applyExtraFiles, detectLegacyConfig } from "./extras.mjs";
+import { applyRestoredFiles, hasPluginCode } from "./apply.mjs";
 import {
   setDpapiSecret,
   listDpapiSecrets,
@@ -194,6 +199,82 @@ async function main() {
       }
     }
     finish({ ok: r.ok, dir: pluginDir, repaired: r.repaired, failed: r.failed, skipped: r.skipped }, r.ok ? 0 : 1);
+    return;
+  }
+
+  // ── agentDir 之外的额外数据归位（extra/）与遗配置探测；不需 WebDAV 配置
+  if (cmd === "apply-extras") {
+    const dir = val("--dir", null);
+    if (!dir) return finish({ ok: false, error: "缺少 --dir（指向恢复出来的目录）" }, 1);
+    const r = applyExtraFiles(dir, { log: logTo, dryRun: has("--dry-run"), force: has("--force") });
+    if (!asJson) {
+      const dryNote = has("--dry-run") ? "（dry-run，未写入）" : "";
+      if (r.source) {
+        const anchors = (r.source.anchors || []).map((a) => `${a.kind}=${a.path}`).join("，");
+        logTo(`来源机器：${r.source.hostname || "?"} (${r.source.platform})  home=${r.source.home}`);
+        if (anchors) logTo(`源锚点：${anchors}`);
+      }
+      if (r.applied.length === 0 && r.skipped.length === 0 && r.unchanged.length === 0 && r.unparsed.length === 0) {
+        logTo("没有需要归位的额外数据（extra/ 为空）。");
+      } else {
+        for (const x of r.applied) logTo(`  ✅ ${x.rel} → ${x.target}${x.mapped ? "（跨机重映射）" : ""}`);
+        for (const x of r.skipped) logTo(`  ➖ ${x.rel} → ${x.target}（${x.reason}）`);
+        for (const x of r.unchanged) logTo(`  =  ${x.rel}（已一致）`);
+        for (const x of r.unmapped) logTo(`  ⚠️  ${x.rel} 未匹配锚点，按原路径归位：${x.orig} → ${x.target}`);
+        for (const x of r.unparsed) logTo(`  ⚠️  ${x.rel} — ${x.reason}`);
+        if (dryNote) logTo(`  ${dryNote}`);
+      }
+    }
+    finish({ ok: r.ok, dir, dryRun: has("--dry-run"), ...r }, r.ok ? 0 : 1);
+    return;
+  }
+
+  // ── 把恢复结果写回当前 agent 目录（换机一键还原）；不需 WebDAV 配置
+  if (cmd === "restore-apply") {
+    const dir = val("--dir", null);
+    if (!dir) return finish({ ok: false, error: "缺少 --dir（指向恢复出来的目录）" }, 1);
+    if (!existsSync(dir)) return finish({ ok: false, error: `恢复目录不存在：${dir}` }, 1);
+    const mergeMode = String(val("--mode", "merge")) !== "replace";
+    const r = applyRestoredFiles(dir, agentDir, {
+      log: logTo,
+      dryRun: has("--dry-run"),
+      force: has("--force"),
+      merge: mergeMode,
+    });
+    const pluginReady = hasPluginCode(dir);
+    if (!asJson) {
+      if (!has("--dry-run")) {
+        logTo(`已写回 agent 目录：${agentDir}（${mergeMode ? "合并模式" : "替换模式"}）`);
+        logTo(`  写入/覆盖 ${r.applied.length} 个，内容一致 ${r.unchanged.length} 个，失败 ${r.failed.length} 个`);
+        if (r.merged?.length) logTo(`  🔀 settings.json 已合并 packages，保留本机已有插件声明`);
+        for (const x of r.skipped) logTo(`  ➖ ${x.rel}（${x.reason}）`);
+        for (const x of r.failed) logTo(`  ❌ ${x.rel} — ${x.error}`);
+        if (pluginReady) logTo("插件实现代码已随备份恢复，无需联网重装。");
+        else logTo("备份里不含插件实现代码，可运行 /backup repair-plugins 联网补装。");
+      } else {
+        logTo(`dry-run：将把 ${r.total} 个文件写回 ${agentDir}（合并模式，${r.skipped.length} 个会跳过）`);
+      }
+    }
+    return finish(
+      { ok: r.ok, dir, agentDir, dryRun: has("--dry-run"), mode: mergeMode ? "merge" : "replace", pluginReady, ...r },
+      r.ok ? 0 : 1,
+    );
+  }
+
+  if (cmd === "detect-legacy") {
+    const found = detectLegacyConfig(agentDir);
+    if (!asJson) {
+      if (found.length === 0) logTo("未发现 agentDir 之外的遗留配置。");
+      else {
+        for (const f of found) {
+          logTo(`  ⚠️  ${f.path}（${f.note}）`);
+          if (f.portable) logTo(`      可移植写法：${f.portable}`);
+          if (f.packages && f.packages.length) logTo(`      包声明：${f.packages.join("、")}`);
+        }
+        logTo("建议把这些文件加入 extraScope，以便随备份一起同步。");
+      }
+    }
+    finish({ ok: true, agentDir, files: found }, 0);
     return;
   }
 

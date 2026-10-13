@@ -26,7 +26,8 @@ import { pipeline } from "node:stream/promises";
 import { randomBytes } from "node:crypto";
 
 import { WebDAVClient } from "./webdav.mjs";
-import { collectFiles } from "./collect.mjs";
+import { collectFiles, deriveSensitivePaths } from "./collect.mjs";
+import { buildExtraMap, EXTRA_MANIFEST_NAME } from "./extras.mjs";
 import { encryptFile, sha256Buffer, sha256File } from "./crypto.mjs";
 
 const TAR_BLOCK = 512;
@@ -182,8 +183,126 @@ export function writeState(stateFile, state) {
  *   auth.json.bak-2026-... / auth.json.tmp 这类副本同样是明文密钥。
  */
 export function isRedactable(relPath) {
+  const p = String(relPath).replace(/\\/g, "/");
+  // 插件实现代码是第三方依赖，不参与脱敏（避免误改；其中个别的 auth.json 多为测试固件）
+  if (p.startsWith("npm/node_modules/") || p.includes("/node_modules/")) return false;
   const base = String(relPath).split("/").pop() ?? "";
   return base.startsWith("auth.json") || base.startsWith("webdav-backup.json");
+}
+
+const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|api[-_]?key|auth(?!or)|cookie|session[-_]?(token|key|secret|id)|bearer|private/i;
+// 密钥引用（$ENV / !cmd / dpapi: / file:）是“密钥放在哪”的指针，不是秘密本身，应保留
+const SECRET_REF_SCHEMES = ["$", "!", "dpapi:", "file:"];
+// 常见凭据前缀，以及“长且像随机串”的值
+const SECRET_VALUE_RE =
+  /^(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|[A-Za-z0-9_+/=-]{32,})$/;
+
+const isSecretRef = (v) =>
+  typeof v === "string" && SECRET_REF_SCHEMES.some((p) => v.trim().startsWith(p));
+const looksSecret = (v) => typeof v === "string" && SECRET_VALUE_RE.test(v.trim());
+
+/** 按字段名 + （可选）值形状递归脱敏一个 JSON 值 */
+function redactJsonValue(obj, { aggressiveValues }) {
+  const walk = (v, keyHint = "") => {
+    if (Array.isArray(v)) return v.map((x) => walk(x, keyHint));
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const [k, val] of Object.entries(v)) {
+        if (SECRET_KEY_RE.test(k)) {
+          // 保留结构，抹掉值。
+          // 只替换字符串：布尔/数字不可能是凭据，
+          // 把 false 替换成字符串会破坏恢复后的配置语义（回归：includeSessions 曾被误伤）
+          out[k] =
+            typeof val === "object" && val !== null
+              ? walk(val, k)
+              : typeof val === "string"
+                ? "__REDACTED__"
+                : val;
+        } else {
+          out[k] = walk(val, k);
+        }
+      }
+      return out;
+    }
+    if (aggressiveValues && looksSecret(v)) return "__REDACTED__";
+    return v;
+  };
+  return walk(obj);
+}
+
+/**
+ * 对一段文本内容做脱敏（含凭据文件与 agentDir 外的 JSON/配置）。
+ * @returns {string} 脱敏后的文本
+ */
+export function redactSensitiveContent(relPath, text, opts = {}) {
+  const aggressive = opts.aggressive !== false;
+  const base = String(relPath).split("/").pop() ?? "";
+
+  if (base.startsWith("auth.json")) {
+    try {
+      const obj = JSON.parse(text);
+      const walkCredential = (cred) => {
+        if (!cred || typeof cred !== "object") return redactJsonValue(cred, { aggressiveValues: aggressive });
+        const out = {};
+        for (const [k, val] of Object.entries(cred)) {
+          if (k === "key") {
+            // 保留引用形式（如 $PI_PI_KEY_DEEPSEEK）——它是可恢复的非秘密指针，
+            // 抹掉反而会丢失“密钥放在哪”的信息；真正的明文才需要处理
+            out[k] = isSecretRef(val) ? val : val === "" ? "" : "__REDACTED__";
+            continue;
+          }
+          out[k] = redactJsonValue(val, { aggressiveValues: aggressive });
+        }
+        return out;
+      };
+      const result = {};
+      for (const [provider, cred] of Object.entries(obj)) {
+        result[provider] = walkCredential(cred);
+      }
+      return JSON.stringify(result, null, 2);
+    } catch {
+      return "__REDACTED_UNPARSEABLE_AUTH_JSON__";
+    }
+  }
+
+  if (base.startsWith("webdav-backup.json")) {
+    try {
+      const obj = JSON.parse(text);
+      const cleaned = redactJsonValue(obj, { aggressiveValues: false });
+      // 与 auth.json 同一约定：密钥引用保留（指针非秘密），
+      // 明文由字段名规则抹掉，这里只需把被误抹的引用还原
+      if (typeof obj.encryptKey === "string" && isSecretRef(obj.encryptKey)) cleaned.encryptKey = obj.encryptKey;
+      const pw = obj.remote && typeof obj.remote === "object" ? obj.remote.password : undefined;
+      if (typeof pw === "string" && isSecretRef(pw) && cleaned.remote) cleaned.remote.password = pw;
+      return JSON.stringify(cleaned, null, 2);
+    } catch {
+      return text;
+    }
+  }
+
+  // agentDir 之外的 JSON/配置（如 ~/.pi/settings.json、~/.config/rpiv-*/config.json）：
+  // 用同一套字段名规则脱敏，不启用“值形状”激进模式（避免把模型名等误伤）。
+  // 仅对 extra/ 路径生效，避免改写 agentDir 内的普通配置格式。
+  const relPosix = String(relPath).replace(/\\/g, "/");
+  if (relPosix.startsWith("extra/") && (/\.json$/i.test(base) || /\.(ya?ml|toml|ini|conf|cfg|txt)$/i.test(base) || base === ".env" || base.startsWith(".env."))) {
+    if (/\.json$/i.test(base)) {
+      try {
+        return JSON.stringify(redactJsonValue(JSON.parse(text), { aggressiveValues: false }), null, 2);
+      } catch {
+        return text;
+      }
+    }
+    // 非 JSON 的键值文本：逐行做 `key=value` / `key: value` 脱敏
+    return text
+      .split(/\r?\n/)
+      .map((line) => {
+        const m = /^(\s*["']?[A-Za-z0-9_.-]*(?:key|token|secret|password|passwd|credential|auth)[A-Za-z0-9_.-]*["']?\s*[:=]\s*)(.*)$/i.exec(line);
+        return m && m[2].trim() && !isSecretRef(m[2].trim()) ? `${m[1]}__REDACTED__` : line;
+      })
+      .join("\n");
+  }
+
+  return text;
 }
 
 /**
@@ -197,98 +316,18 @@ export function isRedactable(relPath) {
  * @returns {Buffer|null} null 表示无需脱敏
  */
 export function redactSensitive(relPath, buf, opts = {}) {
-  const aggressive = opts.aggressive !== false;
-  const base = relPath.split("/").pop() ?? "";
-
-  const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|api[-_]?key|auth(?!or)|cookie|session[-_]?(token|key|secret|id)|bearer|private/i;
-  // 密钥引用（$ENV / !cmd / dpapi: / file:）是“密钥放在哪”的指针，不是秘密本身，应保留
-  const SECRET_REF_SCHEMES = ["$", "!", "dpapi:", "file:"];
-  const isRef = (v) =>
-    typeof v === "string" && SECRET_REF_SCHEMES.some((p) => v.trim().startsWith(p));
-  // 常见凭据前缀，以及“长且像随机串”的值
-  const SECRET_VALUE_RE =
-    /^(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{30,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|[A-Za-z0-9_+/=-]{32,})$/;
-
-  const looksSecret = (v) => typeof v === "string" && SECRET_VALUE_RE.test(v.trim());
-
-  const redactJson = (obj, { aggressiveValues }) => {
-    const walk = (v, keyHint = "") => {
-      if (Array.isArray(v)) return v.map((x) => walk(x, keyHint));
-      if (v && typeof v === "object") {
-        const out = {};
-        for (const [k, val] of Object.entries(v)) {
-          if (SECRET_KEY_RE.test(k)) {
-            // 保留结构，抹掉值。
-            // 只替换字符串：布尔/数字不可能是凭据，
-            // 把 false 替换成字符串会破坏恢复后的配置语义（回归：includeSessions 曾被误伤）
-            out[k] =
-              typeof val === "object" && val !== null
-                ? walk(val, k)
-                : typeof val === "string"
-                  ? "__REDACTED__"
-                  : val;
-          } else {
-            out[k] = walk(val, k);
-          }
-        }
-        return out;
-      }
-      if (aggressiveValues && looksSecret(v)) return "__REDACTED__";
-      return v;
-    };
-    return walk(obj);
-  };
-
-  // 按前缀匹配（见 isRedactable 注释）：
-  //   auth.json           → auth.json / auth.json.bak-* / auth.json.tmp
-  //   webdav-backup.json  → 同上
-  // 早期实现只做 basename === "auth.json" 精确匹配，导致 auth.json.bak-*
-  // 这类副本绕过脱敏，把明文密钥随备份上传到云端。
-  if (base.startsWith("auth.json")) {
-    try {
-      const obj = JSON.parse(buf.toString("utf8"));
-      const walkCredential = (cred) => {
-        if (!cred || typeof cred !== "object") return redactJson(cred, { aggressiveValues: aggressive });
-        const out = {};
-        for (const [k, val] of Object.entries(cred)) {
-          if (k === "key") {
-            // 保留引用形式（如 $PI_PI_KEY_DEEPSEEK）——它是可恢复的非秘密指针，
-            // 抹掉反而会丢失“密钥放在哪”的信息；真正的明文才需要处理
-            out[k] = isRef(val) ? val : val === "" ? "" : "__REDACTED__";
-            continue;
-          }
-          out[k] = redactJson(val, { aggressiveValues: aggressive });
-        }
-        return out;
-      };
-
-      const result = {};
-      for (const [provider, cred] of Object.entries(obj)) {
-        result[provider] = walkCredential(cred);
-      }
-      return Buffer.from(JSON.stringify(result, null, 2), "utf8");
-    } catch {
-      // 解析不了就不能冒险上传原文
-      return Buffer.from("__REDACTED_UNPARSEABLE_AUTH_JSON__", "utf8");
-    }
-  }
-
-  if (base.startsWith("webdav-backup.json")) {
-    try {
-      const obj = JSON.parse(buf.toString("utf8"));
-      const cleaned = redactJson(obj, { aggressiveValues: false });
-      // 与 auth.json 同一约定：密钥引用保留（指针非秘密），
-      // 明文由字段名规则抹掉，这里只需把被误抹的引用还原
-      if (typeof obj.encryptKey === "string" && isRef(obj.encryptKey)) cleaned.encryptKey = obj.encryptKey;
-      const pw = obj.remote && typeof obj.remote === "object" ? obj.remote.password : undefined;
-      if (typeof pw === "string" && isRef(pw) && cleaned.remote) cleaned.remote.password = pw;
-      return Buffer.from(JSON.stringify(cleaned, null, 2), "utf8");
-    } catch {
-      return buf;
-    }
-  }
-
-  return null;
+  const base = String(relPath).split("/").pop() ?? "";
+  const relPosix = String(relPath).replace(/\\/g, "/");
+  const isCred = base.startsWith("auth.json") || base.startsWith("webdav-backup.json");
+  const isExtraData =
+    relPosix.startsWith("extra/") &&
+    (/\.json$/i.test(base) ||
+      /\.(ya?ml|toml|ini|conf|cfg|txt)$/i.test(base) ||
+      base === ".env" ||
+      base.startsWith(".env."));
+  if (!isCred && !isExtraData) return null;
+  const out = redactSensitiveContent(relPath, buf.toString("utf8"), opts);
+  return Buffer.from(out, "utf8");
 }
 
 /**
@@ -305,13 +344,14 @@ export function redactSensitive(relPath, buf, opts = {}) {
  * @returns {{clean: boolean, leaks: {rel: string, reason: string}[]}}
  */
 export function auditForPlaintext(files, opts = {}) {
-  const { agentDir, config, readFile = readFileSync } = opts;
+  const { agentDir, config, readFile = readFileSync, extraSensitive = [] } = opts;
   const leaks = [];
 
   const SUSPICIOUS = [
     /"key"\s*:\s*"(?!\$|!|dpapi:|file:|__REDACTED)([A-Za-z0-9_\-]{16,})"/,
     /"password"\s*:\s*"(?!\$|!|dpapi:|file:|__REDACTED)([^"\s]{6,})"/,
     /"encryptKey"\s*:\s*"(?!\$|!|dpapi:|file:|__REDACTED)([^"\s]{6,})"/,
+    /"apiKey"\s*:\s*"(?!\$|!|dpapi:|file:|__REDACTED)([A-Za-z0-9_\-]{16,})"/,
     /sk-[A-Za-z0-9_-]{20,}/,
     /ghp_[A-Za-z0-9]{20,}/,
     /AIza[0-9A-Za-z_-]{30,}/,
@@ -319,6 +359,12 @@ export function auditForPlaintext(files, opts = {}) {
 
   for (const f of files) {
     const base = f.rel.split("/").pop() ?? "";
+
+    // 插件实现代码（node_modules）是第三方依赖，不是用户配置：
+    // 里面可能有大量字符串字面量（示例密钥、测试数据），逐文件审计既慢又容易误报。
+    // 备份它只是为了恢复后能直接用，不参与凭据审计。
+    const relPosix0 = String(f.rel).replace(/\\/g, "/");
+    if (relPosix0.startsWith("npm/node_modules/") || relPosix0.includes("/node_modules/")) continue;
 
     // 凭据存储文件根本不该出现在待上传列表里（排除规则应已拦住）
     if (looksCredentialFile(f.rel)) {
@@ -340,17 +386,24 @@ export function auditForPlaintext(files, opts = {}) {
 
     let text;
     try {
-      text = readFile(join(agentDir, f.rel), "utf8");
+      // extraScope 的文件在 agentDir 之外，必须用绝对路径读（否则 join 会读错位置）
+      const abs = String(f.rel).replace(/\\/g, "/").startsWith("extra/") ? f.abs : join(agentDir, f.rel);
+      text = readFile(abs, "utf8");
     } catch {
       continue;
     }
     if (typeof text !== "string") continue;
 
     // 对会被脱敏的文件，审计脱敏后的内容（即真正上传的字节）
-    const redacted = redactSensitive(f.rel, Buffer.from(text, "utf8"), {
+    const redactOpts2 = {
       aggressive: config ? !config.encrypt : true,
-    });
+    };
+    const redacted = redactSensitive(f.rel, Buffer.from(text, "utf8"), redactOpts2);
     if (redacted) text = redacted.toString("utf8");
+    // 已经脱敏过一次的 extra 数据，再做值形状命中（如 ~/.pi/settings.json 里的模型 apiKey）
+    if (String(f.rel).replace(/\\/g, "/").startsWith("extra/") && isExtraSensitive(f.rel, extraSensitive)) {
+      text = redactSensitiveContent(f.rel, text, redactOpts2);
+    }
 
     for (const re of SUSPICIOUS) {
       const m = re.exec(text);
@@ -398,7 +451,10 @@ export async function runBackup(config, opts) {
 
   const t0 = Date.now();
   log(`扫描文件… (范围: ${config.scope.join(", ")})`);
-  const { files, skipped, totalSize } = collectFiles({ agentDir, scope: config.scope, exclude });
+  const extraScope = Array.isArray(config.extraScope) ? config.extraScope : [];
+  const { files, skipped, totalSize } = collectFiles({ agentDir, scope: config.scope, exclude, extraScope });
+  // agentDir 之外的路径也可能含凭据（~/.pi/settings.json 等），推导出需脱敏的归档内路径
+  const extraSensitive = deriveSensitivePaths(extraScope);
 
   if (files.length === 0) {
     return { ok: false, error: "没有需要备份的文件（检查 scope 与 exclude 配置）", files: 0 };
@@ -407,7 +463,7 @@ export async function runBackup(config, opts) {
 
   // 未加密上传时，先审计是否还有明文凭据漏网（脱敏白名单之外的第二道防线）
   if (!config.encrypt) {
-    const audit = auditForPlaintext(files, { agentDir, config });
+    const audit = auditForPlaintext(files, { agentDir, config, extraSensitive });
     if (!audit.clean) {
       const detail = audit.leaks.map((l) => `  ${l.rel} — ${l.reason}`).join("\n");
       const msg =
@@ -432,7 +488,7 @@ export async function runBackup(config, opts) {
   }
 
   if (opts.dryRun) {
-    const audit = auditForPlaintext(files, { agentDir, config });
+    const audit = auditForPlaintext(files, { agentDir, config, extraSensitive });
     return {
       ok: true,
       dryRun: true,
@@ -448,9 +504,9 @@ export async function runBackup(config, opts) {
   const baseDir = config.remoteDir;
 
   if (snapshot) {
-    return await runSnapshot({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile });
+    return await runSnapshot({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile, extraScope, extraSensitive });
   }
-  return await runArchive({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile });
+  return await runArchive({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile, extraScope, extraSensitive });
 }
 
 /** 脱敏时的上下文：未加密上传时必须更激进 */
@@ -458,8 +514,15 @@ function redactOpts(config) {
   return { aggressive: !config.encrypt };
 }
 
+/** 归档内相对路径是否命中 extraScope 推导出的敏感路径（目录前缀或精确文件） */
+function isExtraSensitive(rel, extraSensitive) {
+  if (!extraSensitive || extraSensitive.length === 0) return false;
+  const r = String(rel).replace(/\\/g, "/");
+  return extraSensitive.some((p) => (p.endsWith("/") ? r.startsWith(p) : r === p));
+}
+
 /** 归档模式：一个 tar.gz（可选加密）整体上传 */
-async function runArchive({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile }) {
+async function runArchive({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile, extraScope = [], extraSensitive = [] }) {
   const tmpName = `pi-backup-${randomBytes(6).toString("hex")}`;
   const tmpDir = join(tmpdir(), tmpName);
   mkdirSync(tmpDir, { recursive: true });
@@ -470,7 +533,9 @@ async function runArchive({ client, config, files, totalSize, skipped, baseDir, 
     createdAt: new Date().toISOString(),
     agentDir,
     scope: config.scope,
+    extraScope,
     includeSessions: !!config.includeSessions,
+    includePlugins: !!config.includePlugins,
     encrypted: !!config.encrypt,
     totalSize,
     fileCount: files.length,
@@ -485,9 +550,8 @@ async function runArchive({ client, config, files, totalSize, skipped, baseDir, 
     let redactedCount = 0;
 
     for (const f of files) {
-      // 配置文件本身脱敏后写入；其余正常写入
-      const isSelfConfig = f.rel === "webdav-backup.json" || f.rel.endsWith("/webdav-backup.json");
-      if (isRedactable(f.rel)) {
+      // 配置文件本身与 extraScope 下的数据类文件脱敏后写入；其余正常写入
+      if (isRedactable(f.rel) || isExtraSensitive(f.rel, extraSensitive)) {
         try {
           const raw = readFileSync(f.abs);
           const redacted = redactSensitive(f.rel, raw, redactOpts(config));
@@ -504,6 +568,11 @@ async function runArchive({ client, config, files, totalSize, skipped, baseDir, 
     }
     // 附带 manifest 便于恢复时对照
     await tar.addBuffer(Buffer.from(JSON.stringify(manifest, null, 2), "utf8"), ".pi-backup-manifest.json");
+    // 额外数据（extra/）的可移植映射：记录源锚点，恢复时可在不同用户名/盘符的机器上重算目标路径
+    const extraMap = buildExtraMap(files);
+    if (extraMap.entries.length > 0) {
+      await tar.addBuffer(Buffer.from(JSON.stringify(extraMap, null, 2), "utf8"), EXTRA_MANIFEST_NAME);
+    }
     await tar.finish();
 
     log(`压缩中…${redactedCount > 0 ? `（已脱敏 ${redactedCount} 个敏感文件）` : ""}`);
@@ -576,7 +645,7 @@ async function runArchive({ client, config, files, totalSize, skipped, baseDir, 
 }
 
 /** 快照模式：逐文件上传 + manifest 增量 */
-async function runSnapshot({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile }) {
+async function runSnapshot({ client, config, files, totalSize, skipped, baseDir, agentDir, log, t0, stateFile, extraScope = [], extraSensitive = [] }) {
   const dir = `${baseDir}/${config.remoteName}`;
   await client.mkdirp(dir);
   log("读取远端清单…");
@@ -601,9 +670,10 @@ async function runSnapshot({ client, config, files, totalSize, skipped, baseDir,
     const prevEntry = prev[f.rel];
     const isSelf = f.rel === "webdav-backup.json" || f.rel.endsWith("/webdav-backup.json");
     const isAuth = f.rel === "auth.json" || f.rel.startsWith("auth.json") || f.rel.endsWith("/auth.json");
+    const isExtraData = isExtraSensitive(f.rel, extraSensitive);
 
-    // 增量判断：大小与 mtime 都一致则跳过（auth.json / 配置总是重新上传，因为会脱敏）
-    if (prevEntry && prevEntry.size === f.size && prevEntry.mtimeMs === f.mtimeMs && !isAuth && !isSelf) {
+    // 增量判断：大小与 mtime 都一致则跳过（auth.json / 配置 / extra 数据总是重新上传，因为会脱敏）
+    if (prevEntry && prevEntry.size === f.size && prevEntry.mtimeMs === f.mtimeMs && !isAuth && !isSelf && !isExtraData) {
       skippedSame.push(f.rel);
       manifestFiles.push(prevEntry);
       continue;
@@ -611,7 +681,7 @@ async function runSnapshot({ client, config, files, totalSize, skipped, baseDir,
 
     let payload = readFileSync(f.abs);
     let stored = f;
-    if (isRedactable(f.rel)) {
+    if (isRedactable(f.rel) || isExtraData) {
       const redacted = redactSensitive(f.rel, payload, redactOpts(config));
       if (redacted) {
         payload = redacted;
@@ -635,7 +705,9 @@ async function runSnapshot({ client, config, files, totalSize, skipped, baseDir,
     updatedAt: new Date().toISOString(),
     agentDir,
     scope: config.scope,
+    extraScope,
     includeSessions: !!config.includeSessions,
+    includePlugins: !!config.includePlugins,
     totalSize,
     fileCount: files.length,
     files: manifestFiles,
@@ -643,6 +715,14 @@ async function runSnapshot({ client, config, files, totalSize, skipped, baseDir,
   await client.put(`${dir}/manifest.json`, Buffer.from(JSON.stringify(manifest, null, 2), "utf8"), {
     contentType: "application/json",
   });
+
+  // 额外数据（extra/）的可移植映射
+  const extraMap = buildExtraMap(files);
+  if (extraMap.entries.length > 0) {
+    await client.put(`${dir}/${EXTRA_MANIFEST_NAME}`, Buffer.from(JSON.stringify(extraMap, null, 2), "utf8"), {
+      contentType: "application/json",
+    });
+  }
 
   const elapsedMs = Date.now() - t0;
   writeState(stateFile, {

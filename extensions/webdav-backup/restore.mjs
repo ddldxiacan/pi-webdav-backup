@@ -28,6 +28,7 @@ import { WebDAVClient } from "./webdav.mjs";
 import { archiveNameRe } from "./backup.mjs";
 import { decryptFile } from "./crypto.mjs";
 import { extractTar } from "./tar.mjs";
+import { listExtraFiles, readExtraManifest, EXTRA_MANIFEST_NAME } from "./extras.mjs";
 
 /** 列出远端可恢复的备份（归档 + 快照目录） */
 export async function listBackups(config) {
@@ -170,7 +171,10 @@ async function restoreArchive({ client, config, target, destDir, log, workDir })
   log("解包中…");
   const entries = await extractTar(rawTar, destDir);
   const fileCount = entries.filter((e) => !e.dir).length;
+  const extras = listExtraFiles(destDir).map((f) => ({ rel: f.rel, target: f.target, orig: f.orig, mapped: f.mapped }));
+  const extraSource = readExtraManifest(destDir)?.source ?? null;
   log(`恢复完成：${fileCount} 个文件 → ${destDir}`);
+  if (extras.length > 0) log(`其中 ${extras.length} 个属于 agentDir 之外的额外数据（extra/），可用 /backup apply-extras 归位`);
 
   return {
     ok: true,
@@ -178,6 +182,8 @@ async function restoreArchive({ client, config, target, destDir, log, workDir })
     source: target.name,
     dest: destDir,
     files: fileCount,
+    extras,
+    extraSource,
     encrypted: target.name.endsWith(".pibak"),
     header,
   };
@@ -208,13 +214,24 @@ async function restoreSnapshot({ client, config, target, destDir, log, workDir }
     if (done % 20 === 0) log(`  已恢复 ${done}/${files.length}`);
   }
 
+  // extra/ 的可移植映射单独上传，不在 manifest.files 里，需显式取回（否则无法跨机重映射）
+  try {
+    const em = await client.get(`${target.remoteDir}/${EXTRA_MANIFEST_NAME}`);
+    if (em) writeFileSync(join(destDir, EXTRA_MANIFEST_NAME), em);
+  } catch {
+    /* 旧版快照无此文件，忽略 */
+  }
+
   log(`恢复完成：${done} 个文件 → ${destDir}${failed.length ? `（${failed.length} 个失败）` : ""}`);
+  const extras = listExtraFiles(destDir).map((f) => ({ rel: f.rel, target: f.target, orig: f.orig, mapped: f.mapped }));
+  if (extras.length > 0) log(`其中 ${extras.length} 个属于 agentDir 之外的额外数据（extra/），可用 /backup apply-extras 归位`);
   return {
     ok: failed.length === 0,
     mode: "snapshot",
     source: target.name,
     dest: destDir,
     files: done,
+    extras,
     failed,
   };
 }

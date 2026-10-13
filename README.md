@@ -80,7 +80,9 @@ pi install /path/to/pi-webdav-backup                           # 本地目录（
 | `/backup dry` | 试运行：只扫描统计，不上传 |
 | `/backup status` | 查看上次备份时间 |
 | `/backup prune` | 清理旧备份（保留 `keepVersions` 个） |
-| `/backup restore` | 交互选择备份并恢复到临时目录；完成后自动体检恢复目录并询问补装插件 |
+| `/backup restore` | 交互选择备份并恢复；完成后询问是否**写回当前 pi**（换机一键还原）；如含 `extra/` 数据会询问是否归位；未写回时自动体检恢复目录并询问补装插件 |
+| `/backup restore-apply <目录>` | 把恢复目录写回当前 pi 的 agent 目录（覆盖前自动备份） |
+| `/backup apply-extras <目录>` | 把恢复目录里 `agentDir` 之外的额外数据（`extra/`）归位到真实路径 |
 | `/backup verify` | 配置体检：密钥来源、明文告警、连接性 |
 | `/backup plugins` | 插件体检：已声明的插件是否装齐（含逐个依赖查缺失） |
 | `/backup repair-plugins` | 补装缺失的插件 / 依赖（`npm install` / `git clone`） |
@@ -103,6 +105,9 @@ node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --list
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\restore
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs plugins --json [--dir D:\pi-restore]
 node ~/.pi/agent/extensions/webdav-backup/cli.mjs repair-plugins --dry-run [--dir D:\pi-restore]
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs apply-extras --dir D:\pi-restore [--dry-run] [--force]
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs restore-apply --dir D:\pi-restore [--dry-run] [--force]
+node ~/.pi/agent/extensions/webdav-backup/cli.mjs detect-legacy --json
 ```
 
 输出末行固定是 JSON 汇总（`--json` 时只输出该行，人类模式则前面还有日志行），脚本可直接解析；退出码 0 成功 / 1 失败。
@@ -188,48 +193,82 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 |---|---|
 | `sessions/**` | 会话历史，通常很大（可用 `includeSessions` 打开） |
 | `tmp/**`、`web-search-cache/**` | 缓存 |
-| `**/node_modules/**` | 可重装 |
+| `**/node_modules/**` | 可重装（但**开 `includePlugins` 后会一并备份**，见下文） |
+| `bin/**` | pi 自动管理的 `fd`/`rg` 二进制，换机后会重新下载（约 8MB） |
 | `**/*.log` | 日志 |
 
 包含：`extensions/`（你写的扩展）、`models.json`、`models-store.json`、`settings.json`、`trust.json`、`auth.json`、`npm/package.json` 等。
 
+> **想换机一键还原？** 打开 `includePlugins: true`，把插件实现代码（`node_modules`）也备份进去，
+> 新电脑恢复后插件即可直接用，无需联网重装。详见下文「换机一键还原」。
+
+### 插件数据写在 `~/.pi/agent` 之外怎么办（`extraScope`）
+
+有些插件把配置/数据写在 agent 目录之外，默认 `scope: ["."]` 够不到：
+
+| 路径 | 谁写在这里 |
+|---|---|
+| `~/.pi/settings.json` | pi 旧版本遗留的包声明（`~/.pi/npm/` 同理） |
+| `~/.pi/web-search.json` | `pi-web-access` 的回退位置 |
+| `~/.config/rpiv-*/config.json` | `@juicesharp/rpiv-*` 系列（XDG 配置） |
+
+用 `extraScope` 把这些**绝对路径（或 `~/...`）**一并备份；归档内统一放在 `extra/` 前缀下：
+
+```jsonc
+{
+  "extraScope": [
+    "~/.pi/settings.json",
+    "~/.pi/web-search.json",
+    "~/.config/rpiv-todo"
+  ]
+}
+```
+
+- 备份时：`extra/` 内的 JSON/配置会按字段名（`key`/`token`/`password`/`apiKey`…）脱敏
+- 恢复时：默认只解到恢复目录；`/backup restore` 会询问是否**归位**到真实路径，也可手动
+  `node cli.mjs apply-extras --dir <恢复目录>`
+- **跨机可移植**：备份时会把每个文件的归属记成“锚点 + 尾巴”（`home` / `config`(XDG) / `appdata`），
+  恢复时按**当前机器**的锚点重算目标。换用户名、换盘符、Linux↔Windows 都能正确归位：
+  - 旧机 `/home/alice/.pi/settings.json` → 新机 `/home/bob/.pi/settings.json`
+  - 旧机 `C:/Users/alice/.pi/settings.json` → 新机 `D:/Users/carol/.pi/settings.json`
+  - 不在任何锚点下的绝对路径（如 `/etc/foo`）保持原样，并在结果里标为 `unmapped` 以便你核对
+- 安全：若本地已存在“真实值”、而归档里是 `__REDACTED__`，归位会**跳过**该文件（除非加 `--force`），
+  以免把真密钥覆盖成占位符；覆盖前会把原文件存为 `<name>.bak-extras-<时间戳>`
+- 探测遗留配置：`/backup-setup` 会自动检测并询问是否纳入；也可 `node cli.mjs detect-legacy`
+
+> 归档里的 `extra-manifest.json` 记录了源机器的 `platform`/`hostname`/`home` 与各锚点，
+> 归位时会打印出来，便于确认“这次恢复来自哪台机器”。
+
 ### 插件（install 装的包）会怎样
 
-**声明与源码都会备份，但插件实现代码（`node_modules`）不备份** —— 它体积大、含平台相关二进制，而 lockfile 足以重建。
+插件是否连同**实现代码（`node_modules`）**一起备份，由 `includePlugins` 决定：
 
-| 插件类型 | 备份里有什么 | 恢复后 |
+| `includePlugins` | 备份里有什么 | 恢复后 |
 |---|---|---|
-| `git:` | 包源码（`git/**`，含浅克隆 `.git`） | 源码在；但包自己的 `node_modules` 不在，需补装依赖 |
-| `npm:` | 仅声明（`npm/package.json` + `package-lock.json`） | 代码全不在，需重新 `npm install` |
+| `false`（默认，瘦备份） | 声明 + `git:` 源码；npm 包只有 `package.json`/lockfile | 插件实现不在，需联网 `/backup repair-plugins` 补装 |
+| `true`（推荐，换机一键还原） | 连同 `node_modules` 一起 | 插件直接可用，无需联网 |
 
-因此**恢复后插件不会自动就位**，需要补装。pi 本身只在“git 包目录完全不存在”时才重装；
-目录在、只是缺 `node_modules` 时它不会补，插件会静默带病运行（有运行时依赖的包会报错）。
+开启 `includePlugins: true` 时，会保留 `npm/node_modules/**`、`git/**/node_modules/**`，仅排除其中运行时用不到、
+体积大的内部数据（`**/.git/**`、`node_modules/.cache`、`.vite`、`.turbo`、`.bin`）。
 
-用这两条命令善后：
-
-```
-/backup plugins          # 体检：哪些已声明插件没装好
-/backup repair-plugins   # 补装（git 缺失则 clone，依赖缺失则 npm install）
-```
-
-`/backup restore` 完成后会自动体检**刚恢复出来的目录**并询问是否补装（恢复默认解到临时目录，
-所以体检的是那个临时目录，而不是当前 `~/.pi/agent`）；也会顺带看一眼正在用的 agent 目录。
-拷贝到 `~/.pi/agent` 后仍可随时手动执行 `/backup plugins` / `/backup repair-plugins`。
-
-> 不想恢复后重建？把 `node_modules` 备份进去需要改代码（`DEFAULT_EXCLUDE` 是内置的，
-> 配置里的 `exclude` 只能追加、不能移除），而且会带来两个问题：体积暴涨（本例单个 git 包
-> 就 131MB）、跨平台时会带上不兼容的原生二进制。所以推荐「瘦备份 + 恢复后补装」这套流程。
+> **取舍**：`true` 能实现真正的一键还原，代价是体积变大（有原生依赖时可能几百 MB，且同一份备份在
+> 不同平台间可能带入不兼容的二进制）。`false` 体积小，但恢复后必须联网补装。
+>
+> 无论哪种模式，`/backup restore` 都不再强制联网：开启 `includePlugins` 后，恢复流程会检测到
+> 备份里已含插件代码并跳过补装提示。
 
 ### 敏感文件脱敏（重要）
 
-**未加密**备份时，`auth.json` 与 `webdav-backup.json` 会先脱敏再上传：
+备份时（**加密与否都会**），`auth.json`、`webdav-backup.json` 以及 `extraScope` 下的 JSON/配置会先脱敏再上传：
 
-- 按字段名匹配：`key` / `token` / `secret` / `password` / `credential` / `cookie` / `private` …
-- **并按值的形状匹配**：`sk-…`、`ghp_…`、`AIza…`、JWT、32 位以上随机串
-- 命中替换为 `__REDACTED__`，结构保留
+- 按字段名匹配：`key` / `token` / `secret` / `password` / `credential` / `cookie` / `apiKey` / `private` …
+- **未加密时**还额外按值的形状匹配：`sk-…`、`ghp_…`、`AIza…`、JWT、32 位以上随机串
+- 命中替换为 `__REDACTED__`，结构保留；密钥**引用**（`$ENV` / `dpapi:` / `file:`）不会被抹
 - 解析失败时整文件替换为占位符，**绝不原样上传**
 
-> 脱敏是「尽力而为」的防泄漏措施。真正的安全做法是开启 `encrypt`。
+> 因为加密备份同样会脱敏，**用明文写的 API key / 密码无法从备份恢复**（会变成 `__REDACTED__`）。
+> 建议一律用 `$ENV` / `dpapi:` 引用（引用会被保留，恢复后仍可用）。
+> 脱敏是「尽力而为」的防泄漏措施，真正的安全做法是开启 `encrypt`。
 
 ---
 
@@ -249,6 +288,8 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 
   "scope": ["."],                  // 相对 ~/.pi/agent 的路径，可写 ["extensions", "models.json"]
   "exclude": [],                   // 额外 glob 排除规则
+  "extraScope": [],                // agentDir 之外的额外备份路径（绝对路径或 ~/...），见上文「插件数据」
+  "includePlugins": false,         // 是否把插件实现（node_modules）一起备份（换机一键还原的关键），见上文
   "includeSessions": false,        // 是否备份会话历史
   "snapshot": false,               // 见下文「两种模式」
 
@@ -331,40 +372,70 @@ node "$env:USERPROFILE\.pi\agent\extensions\webdav-backup\cli.mjs" install-cron 
 ## 恢复
 
 ```
-/backup restore          # 选择备份 → 恢复到临时目录
+/backup restore          # 选择备份 → 恢复 → 询问是否写回当前 pi
 ```
 
-**默认恢复到临时目录，不会直接覆盖 `~/.pi/agent`** —— 因为恢复旧配置可能覆盖你当前的密钥。
+恢复分两步：先解到临时目录（不会直接动你的现有配置），再由你确认后才写回 `~/.pi/agent`。
+写回前每个被覆盖的旧文件都会另存为 `<名字>.bak-apply-<时间戳>`。
 
-完整流程：
+**换机一键还原（推荐）**：新电脑装好 pi → `/backup-setup` 配好同一 WebDAV → `/backup restore -y`：
 
 ```
 /backup restore
   ├─ 选备份（`-y` 直接取最新）→ 解压到临时目录
-  ├─ 自动体检【刚恢复出来的目录】→ 插件缺安装/缺依赖时询问是否补装
-  ├─ 把临时目录里需要的文件拷到 ~/.pi/agent
-  └─ 顺带再体检一次正在用的 agent 目录（如果你已拷过去）
-/reload                  # 插件即可用
+  ├─ 本机已装插件时选【合并 / 替换】（见下）
+  ├─ 询问是否【写回当前 pi】（restore-apply）
+  │    ├─ 是：把配置/扩展/插件实现写回 ~/.pi/agent（覆盖前自动备份）
+  │    └─ 否：只留在临时目录，你自己拷
+  ├─ 如含 extra/ 额外数据（~/.pi/settings.json 等）→ 询问是否归位
+  └─ 若备份已含插件代码 → 完成；否则体检并询问联网补装
+/reload                  # 重启 pi 后插件即可用
 ```
 
-恢复后自行拷贝需要的文件：
+前置条件：备份时开启了 `includePlugins: true`，插件实现才会在备份里；否则写回后仍需联网补装。
 
-```powershell
-# 归档恢复结果示例
-# C:\Users\...\Temp\pi-restore-XXXX\restored\extensions\...
-copy "$env:TEMP\pi-restore-XXXX\restored\extensions\*.ts" "$env:USERPROFILE\.pi\agent\extensions\"
+#### 本机已经装了插件时，写回（合并 vs 替换）
+
+新电脑往往已经装过一些插件——可能和备份里同名但版本不同，也可能多装了备份里没有的。
+直接覆盖会**把同名插件降级、把本机多装的声明抹掉、留下版本混合的“缝合”目录**。所以写回有两种模式：
+
+| 模式 | settings.json 的 packages | 本机已装的插件实现 | 本机多装的插件 |
+|---|---|---|---|
+| **合并**（默认，推荐） | 本机声明优先，追加备份里本机没有的 | **保留本机版本**，不覆盖 | 保留（声明与代码都留） |
+| 替换（旧机原样） | 完全用备份版 | 被备份覆盖（同名降级） | 声明被移除（代码不删） |
+
+- 交互式 `/backup restore`：本机有插件声明时会先让你选（默认合并）
+- 命令行：`--mode merge`（默认）/ `--mode replace`
+
+> “合并”对**已安装**的插件只保声明与代码、不升级也不降级；备份里本机没有的插件则连代码一起补入。
+> 想完全回到旧机器状态（含同名降级）用“替换”。两种模式都不会删除本机多装的插件**代码**，
+> 只会（在替换时）从其 `settings.json` 声明里移除。
+
+手动写回某个已恢复目录（不重新下载）：
+
+```
+/backup restore-apply <目录>
+# 或命令行：
+node cli.mjs restore-apply --dir D:\pi-restore [--dry-run] [--force] [--mode merge|replace]
 ```
 
-指定目标目录（谨慎）：
+写回的安全规则：
 
-```bash
-node cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\pi-restore
-```
+- 只写回 agent 目录内的内容；`extra/`（agentDir 之外）由 `apply-extras` 单独处理
+- 自动跳过备份/恢复产生的元数据（manifest、state、log）
+- 目标已存在且内容不同时，先备份旧文件再覆盖（`.bak-apply-*`）
+- 归档里是 `__REDACTED__` 而本地有真实值时跳过（除非 `--force`），避免把真密钥抹掉
+- 合并模式下，本机已装插件的目录整体保留，不写入备份里的同名文件（避免版本混合）
 
-### 恢复后把插件装回来
+> 若只想解到指定目录、不写回：
+> ```bash
+> node cli.mjs restore --file pi-agent-20260924-120000.tar.gz --to D:\pi-restore
+> ```
 
-插件声明与源码会随备份回来，但**插件实现代码 `node_modules` 不备份**。恢复后跑（`--dir` 指向
-刚恢复出来的目录，不加则看当前 `~/.pi/agent`）：
+### 恢复后把插件装回来（仅瘦备份需要）
+
+如果备份时**没有**开启 `includePlugins`，插件实现代码 `node_modules` 不在备份里，需要联网补装。
+恢复后跑（`--dir` 指向刚恢复出来的目录，不加则看当前 `~/.pi/agent`）：
 
 ```
 /backup plugins          # 看哪些插件没装好
@@ -387,9 +458,9 @@ node cli.mjs repair-plugins --dir D:\pi-restore
 > 来源解析与 pi 的 `parseGitUrl` 完全对齐：支持 `git:` 简写、`https://…` URL、`git@host:path` scp 形式，
 > ref 可含 `/`（如 `feature/x`），`.git` 后缀自动去掉（否则会装到 pi 找不到的目录）。
 
-> `/backup restore` 恢复完会自动体检**刚恢复出来的目录**并询问是否立即补装——体检的是临时目录，
-> 不是当前 `~/.pi/agent`（声明还在临时目录里，看错目录会永远报“没声明插件”）。
-> `/backup restore -y` 只略过「恢复哪个 / 是否恢复」的询问，插件补装仍会单独问一次。
+> `/backup restore` 在**未写回**时会自动体检**刚恢复出来的目录**并询问是否立即补装（体检的是临时目录，
+> 而不是当前 `~/.pi/agent`，因为声明还在临时目录里）；若已写回当前目录，则看点目录。
+> `/backup restore -y` 只略过「恢复哪个」的询问，写回与补装仍会各自询问一次。
 
 ### 加密备份的恢复
 
@@ -413,7 +484,7 @@ npm test
 node extensions/webdav-backup/verify-load.mjs
 ```
 
-9 个测试文件、373 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
+11 个测试文件、450+ 项断言，用内置的内存 WebDAV 服务端做真实 HTTP 往返：
 
 | 文件 | 覆盖 |
 |---|---|
@@ -421,6 +492,8 @@ node extensions/webdav-backup/verify-load.mjs
 | `test-cli.mjs` | 真实子进程调用 CLI、退出备份、DPAPI 端到端、doctor、日志、状态 |
 | `test-restore.mjs` | 归档/加密/快照恢复、目录穿越防护、302 重定向（对象存储）恢复 |
 | `test-plugins.mjs` | 插件声明解析（与 pi 官方 parseGitUrl 对齐：`.git` 后缀、ref 含 `/`、URL/scp 来源）、恢复后体检（缺安装/逐个依赖查缺依赖）、补装、SHA ref 回退、dry-run、真实恢复往返 |
+| `test-apply.mjs` | 换机一键还原：`includePlugins` 排除组装与收集、含插件归档往返恢复、`restore-apply` 写回/覆盖前备份/幂等/dry-run/防止 `__REDACTED__` 覆盖真值、跳过 `extra/` 与元数据 |
+| `test-extras.mjs` | `agentDir` 之外的额外数据（`extraScope`）：路径映射互逆、**跨机锚点重映射**（换用户名/盘符/平台）、收集、脱敏、恢复归位、幂等、`--force` 安全防护、遗留配置探测 |
 | `test-redact.mjs` | 脱敏（含「字段名无关但值是密钥」的回归用例） |
 | `test-json.mjs` | CLI 输出 JSON 解析容错（回归：空输出曾抛裸 JSON 错误吞掉 stderr） |
 | `test-empty-cmd.mjs` | 空参数/子命令解析、输出契约（回归：`/backup` 不带参数曾报「未知命令：」、完成提醒拿不到 JSON 汇总） |
@@ -433,6 +506,8 @@ node extensions/webdav-backup/verify-load.mjs
 
 | 版本 | 内容 |
 |---|---|
+| **v1.3.0** | **换机一键还原**：新增 `includePlugins`（把插件实现 `node_modules` 一并备份，重机恢复即可直接用，无需联网重装）；新增 `restore-apply` / `/backup restore-apply`（把恢复结果写回当前 `~/.pi/agent`，覆盖前备份、幂等、防止 `__REDACTED__` 覆盖真值）；**写回默认【合并模式】**：本机已装插件保留不被覆盖、`settings.json` 只合并 `packages`（避免删掉/降级本机插件），可选 `--mode replace` 完全还原；`/backup restore` 默认询问是否写回当前 pi，已含插件时不再提示联网补装；`/backup-setup` 向导新增插件代码选项；脱敏审计跳过第三方插件代码（避免误报）；排除规则重构（`includePlugins` 开关控制 node_modules） |
+| **v1.2.0** | **插件数据跨机同步补齐**：新增 `extraScope`（备份 `agentDir` 之外的路径，如 `~/.pi/settings.json`、`~/.config/rpiv-*`，归档内放 `extra/` 前缀）；归档写入 `extra-manifest.json`，按 `home`/`config`(XDG)/`appdata` 锚点记录归属，恢复时按当前机器重算目标（换用户名/盘符/平台均可）；`/backup apply-extras` 归位（幂等、覆盖前备份、防止 `__REDACTED__` 覆盖真密钥、支持 `--force`、未映射路径单独提醒）；新增 `detect-legacy` 探测遗留配置；`/backup-setup` 引导纳入；默认排除新增 `bin/**`；README 澄清加密备份同样会脱敏 |
 | **v1.1.0** | **插件备份/恢复修好**：恢复后自动体检「恢复出来的目录」并补装（此前看错目录，补装提示永不出现）；`plugins`/`repair-plugins` 新增 `--dir`；git 来源解析与 pi 完全对齐（`.git` 后缀、ref 含 `/`、`https://`/scp 形式）；commit SHA ref 自动回退为完整 clone + checkout；缺依赖逐个检测；安装参数对齐 pi（`--legacy-peer-deps` / `--omit=dev`）；Windows 路径含空格不再报错。另含 v1.0.2 之后的修复：恢复遇 302 重定向到对象存储自动跟随（不外泄凭据）、完成通知拿不到汇总的回归 |
 | **v1.0.2** | 初始发布：归档/快照两种备份模式、AES-256-GCM 加密、DPAPI/环境变量/命令密钥、明文脱敏、退出自动备份与每日定时备份、恢复到临时目录 |
 
@@ -455,7 +530,8 @@ node extensions/webdav-backup/verify-load.mjs
 | DPAPI 解密失败 | 密文只能在本机本用户下解；换机器/换用户需重新 `/backup keys set` |
 | 提示「环境变量未设置」 | `/backup keys set` 改用 dpapi，或先设好该环境变量 |
 | 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.1.0+ |
-| 恢复后插件不生效 | 插件代码（`node_modules`）有意不入备份。`/backup restore` 会自动体检并询问补装；手动用 `/backup plugins` / `/backup repair-plugins`（可带 `--dir` 指向恢复目录）。注意补装需联网 |
+| 恢复后插件不生效 | 若备份时未开启 `includePlugins`，插件代码（`node_modules`）不在备份里，需联网补装：`/backup repair-plugins`（可带 `--dir`）。推荐下次备份开启 `includePlugins: true`，下次即可一键还原 |
+| 写回时提示跳过某些文件 | 归档里是 `__REDACTED__` 而本地已有真实密钥时会被跳过（避免把真密钥抹掉）；确认要覆盖可加 `--force` |
 | 补装报 `git clone` 失败 | 确认能访问 github.com 等源；ref 是 commit SHA 时会自动回退为完整 clone + checkout，仍失败则看日志里的 git 输出 |
 | 插件体检一直报「缺少安装」 | 多半是 `.git` 后缀 / ref 形式的声明被装到了 pi 找不到的目录；v1.1.0+ 已与 pi 的解析对齐，升级后跑一次 `/backup repair-plugins` |
 | 配置体检 | `/backup verify` 一次看全部状态 |
