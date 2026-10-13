@@ -120,14 +120,17 @@ node ~/.pi/agent/extensions/webdav-backup/cli.mjs detect-legacy --json
 
 | 语法 | 说明 | 适用 |
 |---|---|---|
-| `dpapi:名称` | **推荐**。Windows DPAPI 用户级加密存入 `secrets.dpapi.json`，本机本用户可解，**无需主密码** | Windows |
-| `$ENV_VAR` / `${ENV_VAR}` | 环境变量（也支持 `$A-$B` 拼接，`$$` 转义） | 跨平台 |
-| `file:路径` | 从文件读取（自动去换行；相对路径基于 `~/.pi/agent`） | 跨平台 |
-| `!命令` | 执行命令取 stdout（可对接密码管理器 CLI） | 跨平台 |
+| `dpapi:名称` | Windows DPAPI 用户级加密存入 `secrets.dpapi.json`，本机本用户可解，**无需主密码** | 仅 Windows |
+| `$ENV_VAR` / `${ENV_VAR}` | 环境变量（也支持 `$A-$B` 拼接，`$$` 转义） | **跨平台** |
+| `file:路径` | 从文件读取（自动去换行；相对路径基于 `~/.pi/agent`） | **跨平台** |
+| `!命令` | 执行命令取 stdout（可对接密码管理器 CLI） | **跨平台** |
 | `plain:值` | 显式声明明文（会告警，仅调试用） | — |
 | 其他值 | 视为明文（**会告警**） | — |
 
 > 该语法与 pi 自身的 `resolve-config-value` 约定一致，`auth.json` 的 `key` 字段也支持 `$ENV_VAR` 与 `!命令`。
+>
+> ⚠️ **要跨 Windows / Linux / macOS 多机同步，用 `file:` 或 `$ENV`，不要用 `dpapi:`**——同 DPAPI 密文只能在本机本用户解密。
+> 详见下文「跨平台密钥（多机同步）」。
 
 ### 推荐做法
 
@@ -182,6 +185,46 @@ node cli.mjs migrate --method file   # 写入 0600 权限的 secrets/ 目录
 setx PI_WEBDAV_BACKUP_PASSWORD "你的应用密码"
 setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 ```
+
+### 跨平台密钥（多机同步）
+
+`dpapi:` 只能在 Windows 本机本用户解密，**同一份配置在 Linux 上会解析失败**。要在 Windows/Linux/macOS 多机共用一套配置，改用 `file:`（推荐，无需改 shell）或 `$ENV`。
+
+**方案：`file:` 相对引用**（配置里写相对 `agentDir` 的路径，各平台写法一致）
+
+```jsonc
+{
+  "remote": { "password": "file:secrets/webdav-password.txt" },
+  "encrypt": true,
+  "encryptKey": "file:secrets/backup-key.txt"
+}
+```
+
+每台机器各创建一次密钥文件（内容相同）：
+
+```bash
+mkdir -p ~/.pi/agent/secrets
+printf '%s' '你的加密口令'   > ~/.pi/agent/secrets/backup-key.txt
+printf '%s' '你的应用密码'   > ~/.pi/agent/secrets/webdav-password.txt
+chmod 600 ~/.pi/agent/secrets/*.txt      # Windows 可忽略
+```
+
+> `secrets/**` 默认被排除，**密钥不会随备份上传**。所以新机器必须手动做一次这步（这是唯一的手动环节）。
+> 读取时会自动去掉行尾换行，`echo`/`printf` 都可以。
+
+**方案：`$ENV`**
+
+配置里写 `"encryptKey": "$PI_WEBDAV_BACKUP_KEY"`，然后各机器设同名环境变量（值相同）：
+
+```bash
+# Linux / macOS：~/.bashrc 或 ~/.zshrc
+export PI_WEBDAV_BACKUP_KEY="你的加密口令"
+
+# Windows PowerShell（需新开终端生效）
+setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
+```
+
+从现有 `dpapi:` 迁移：`node cli.mjs migrate --method file`（写入 `secrets/`）或 `--method env`（写入用户环境变量）。
 
 ---
 
@@ -294,7 +337,7 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
   "snapshot": false,               // 见下文「两种模式」
 
   "encrypt": false,                // AES-256-GCM 加密
-  "encryptKey": "dpapi:backup-key",  // 密钥引用（≥16 位），或 $PI_WEBDAV_BACKUP_KEY
+  "encryptKey": "dpapi:backup-key",  // 密钥引用（≥16 位）：dpapi:名称 / $ENV_VAR / file:路径；见上文「密钥」
 
   "backupOnExit": true,            // 退出 pi 时自动备份
   "backupOnExitMinIntervalMinutes": 30,   // 两次自动备份最小间隔
@@ -315,10 +358,10 @@ setx PI_WEBDAV_BACKUP_KEY "你的加密口令"
 | **群晖 WebDAV** | `https://NAS地址:5006/<共享文件夹>` | DSM 账号 | DSM 密码 |
 | **自建 rclone serve** | `http://主机:端口/` | `--user` 指定的值 | `--pass` 指定的值 |
 
-> ⚠️ 密码建议用 `dpapi:` 引用而非明文，见下方「密钥不明文落盘」：
+> ⚠️ 密码建议用引用而非明文（**多机同步请用 `file:` / `$ENV`，不要用 `dpapi:`**）：
 > ```
-> /backup keys set webdav-password
-> # 然后在配置里写 "password": "dpapi:webdav-password"
+> /backup keys set webdav-password          # Windows DPAPI
+> # 跨平台："password": "file:secrets/webdav-password.txt"
 > ```
 > 也可用环境变量：`setx PI_WEBDAV_BACKUP_PASSWORD "你的应用密码"`
 
@@ -470,6 +513,90 @@ node cli.mjs repair-plugins --dir D:\pi-restore
 
 ---
 
+## 多机同步（Windows ↔ Linux）
+
+⚠️ 先认清本质：**这是"备份/恢复"，不是实时双向同步。**
+
+| 命令 | 方向 |
+|---|---|
+| `/backup` | 本机 → 云端（上传） |
+| `/backup restore` | 云端 → 本机（下载，默认合并） |
+
+两台机器各自 `/backup` 会互相覆盖，建议**以一台为主机**，其他机器只做 `/backup restore`。
+
+### 一、旧机（主机）：先备份
+
+```
+/backup dry        # 确认扫描结果（开了 includePlugins 会含几百 MB 插件代码）
+/backup            # 正式备份
+```
+
+### 二、新机：安装 + 恢复
+
+```bash
+# 1. 装插件（GitHub / npm 二选一）
+pi install git:github.com/ddldxiacan/pi-webdav-backup@v1
+# 然后重启 pi
+
+# 2. 创建密钥文件（内容与旧机一致；secrets/ 不入备份，故需手动一次）
+mkdir -p ~/.pi/agent/secrets
+printf '%s' '你的加密口令' > ~/.pi/agent/secrets/backup-key.txt
+printf '%s' '你的应用密码' > ~/.pi/agent/secrets/webdav-password.txt
+chmod 600 ~/.pi/agent/secrets/*.txt
+
+# 3. 写配置 ~/.pi/agent/webdav-backup.json（与旧机相同，密钥用 file:）
+```
+
+配置文件模板（Windows/Linux 通用）：
+
+```jsonc
+{
+  "enabled": true,
+  "remote": {
+    "url": "https://你的.webdav/dav",
+    "username": "you@example.com",
+    "password": "file:secrets/webdav-password.txt",
+    "remoteDir": "pi-backup",
+    "remoteName": "pi"
+  },
+  "scope": ["."],
+  "includePlugins": true,
+  "extraScope": ["~/.pi/settings.json"],
+  "encrypt": true,
+  "encryptKey": "file:secrets/backup-key.txt",
+  "includeSessions": false
+}
+```
+
+```
+# 4. 测连接 + 恢复
+/backup check
+/backup restore -y     # 选备份 → 解密解压 → 选合并/替换 → 写回 → 归位 extra → 完成
+/reload
+```
+
+### 三、关键约束
+
+| 项 | 要求 |
+|---|---|
+| `encryptKey` | **两台机器值必须一致**，否则解不开加密备份 |
+| 密钥引用 | 多机一律用 `file:` 或 `$ENV`，**不要用 `dpapi:`**（只能本机解密） |
+| `remote.url` / `remoteDir` / `remoteName` | 两台机器必须完全一致，否则找不到备份 |
+| 插件还原 | 旧机需开 `includePlugins: true`；否则新机恢复后要联网 `/backup repair-plugins` |
+| 合并/替换 | 新机已装插件时，默认"合并"（保留本机已装的，只补缺失） |
+
+### 四、常见坑
+
+| 症状 | 处理 |
+|---|---|
+| 新机报"加密密钥解析失败" | 用了 `dpapi:` 但非 Windows；改用 `file:` / `$ENV` |
+| 解密失败 | `backup-key` 与旧机不一致（或旧备份用了更早的口令） |
+| 恢复后插件不生效 | 旧机未开 `includePlugins` → `/backup repair-plugins` 联网补装 |
+| 恢复后缺插件声明 | 插件声明在 `~/.pi/settings.json`（非 agent）→ 加入 `extraScope` |
+| 连接 401 | WebDAV 密码错（坚果云要用**应用密码**） |
+
+---
+
 ## 测试
 
 ```bash
@@ -506,6 +633,8 @@ node extensions/webdav-backup/verify-load.mjs
 
 | 版本 | 内容 |
 |---|---|
+| **v1.3.2** | **跨平台多机同步**：依赖体检修正（npm 提升到父级的依赖不再误报为缺失，按 Node 模块解析算法沿祖先 `node_modules` 查找）；文档新增「跨平台密钥（多机同步）」与「多机同步（Windows ↔ Linux）」流程，明确多机用 `file:` / `$ENV` 而非 `dpapi:`，并给出常见坑 |
+| **v1.3.1** | 依赖体检误报修正（npm 提升的依赖被当成缺失） |
 | **v1.3.0** | **换机一键还原**：新增 `includePlugins`（把插件实现 `node_modules` 一并备份，重机恢复即可直接用，无需联网重装）；新增 `restore-apply` / `/backup restore-apply`（把恢复结果写回当前 `~/.pi/agent`，覆盖前备份、幂等、防止 `__REDACTED__` 覆盖真值）；**写回默认【合并模式】**：本机已装插件保留不被覆盖、`settings.json` 只合并 `packages`（避免删掉/降级本机插件），可选 `--mode replace` 完全还原；`/backup restore` 默认询问是否写回当前 pi，已含插件时不再提示联网补装；`/backup-setup` 向导新增插件代码选项；脱敏审计跳过第三方插件代码（避免误报）；排除规则重构（`includePlugins` 开关控制 node_modules） |
 | **v1.2.0** | **插件数据跨机同步补齐**：新增 `extraScope`（备份 `agentDir` 之外的路径，如 `~/.pi/settings.json`、`~/.config/rpiv-*`，归档内放 `extra/` 前缀）；归档写入 `extra-manifest.json`，按 `home`/`config`(XDG)/`appdata` 锚点记录归属，恢复时按当前机器重算目标（换用户名/盘符/平台均可）；`/backup apply-extras` 归位（幂等、覆盖前备份、防止 `__REDACTED__` 覆盖真密钥、支持 `--force`、未映射路径单独提醒）；新增 `detect-legacy` 探测遗留配置；`/backup-setup` 引导纳入；默认排除新增 `bin/**`；README 澄清加密备份同样会脱敏 |
 | **v1.1.0** | **插件备份/恢复修好**：恢复后自动体检「恢复出来的目录」并补装（此前看错目录，补装提示永不出现）；`plugins`/`repair-plugins` 新增 `--dir`；git 来源解析与 pi 完全对齐（`.git` 后缀、ref 含 `/`、`https://`/scp 形式）；commit SHA ref 自动回退为完整 clone + checkout；缺依赖逐个检测；安装参数对齐 pi（`--legacy-peer-deps` / `--omit=dev`）；Windows 路径含空格不再报错。另含 v1.0.2 之后的修复：恢复遇 302 重定向到对象存储自动跟随（不外泄凭据）、完成通知拿不到汇总的回归 |
