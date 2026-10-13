@@ -15,6 +15,7 @@ export function startDavServer({
   password = "pass",
   requireAuth = true,
   redirectGetsTo = null,
+  failFirstPuts = 0,
 } = {}) {
   /** @type {Map<string, Buffer>} */
   const store = new Map();
@@ -22,6 +23,7 @@ export function startDavServer({
   const expectedAuth = "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
   let putCount = 0;
   let getCount = 0;
+  let lockedCount = 0;
   let lastAuth = null;
 
   const server = http.createServer((req, res) => {
@@ -98,6 +100,12 @@ export function startDavServer({
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
+        // 故障注入：前 N 次 PUT 返回 423 Locked
+        if (lockedCount < failFirstPuts) {
+          lockedCount++;
+          res.writeHead(423, { "Retry-After": "1" }).end("locked");
+          return;
+        }
         putCount++;
         store.set(key, Buffer.concat(chunks));
         res.writeHead(201).end();
@@ -152,13 +160,14 @@ export function startDavServer({
         port,
         store,
         dirs,
-        stats: () => ({ putCount, getCount }),
+        stats: () => ({ putCount, getCount, lockedCount }),
         get lastAuth() {
           return lastAuth;
         },
         reset: () => {
           putCount = 0;
           getCount = 0;
+          lockedCount = 0;
         },
       });
     });

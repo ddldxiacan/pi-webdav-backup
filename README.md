@@ -636,6 +636,7 @@ node extensions/webdav-backup/verify-load.mjs
 
 | 版本 | 内容 |
 |---|---|
+| **v1.4.0** | **跨平台健壮性**：① 合并/恢复时**过滤旧机器专属的绝对路径本地源**（`E:\...`、`/home/...`、UNC）——`pi install /绝对/路径` 会把路径写进 settings.json，跨机恢复时无效，现在不再带入目标机；② WebDAV 客户端对 **423 Locked / 429 / 5xx 与网络抖动自动重试**（指数退避，尊重 `Retry-After`，上限 4 次），修复实测中两个实例并发上传导致的 423 直接失败；新增 `test-webdav.mjs`（故障注入）与跨平台路径回归用例 |
 | **v1.3.3** | **修复合并模式会卸载本机插件**：`restore-apply` 合并模式此前只合并 `settings.json`，却用备份版**覆盖** `npm/package.json`——pi 下次启动的 npm 协调会把本机独有插件当成多余包卸载（实测于 Windows→Linux 同步）。现改为同时合并 `npm/package.json` 的 `dependencies`（本机优先），结果里标 `npm-dependencies`。另：文档补充「多机同步」与「跨平台密钥」流程 |
 | **v1.3.2** | **跨平台多机同步**：依赖体检修正（npm 提升到父级的依赖不再误报为缺失，按 Node 模块解析算法沿祖先 `node_modules` 查找）；文档新增「跨平台密钥（多机同步）」与「多机同步（Windows ↔ Linux）」流程，明确多机用 `file:` / `$ENV` 而非 `dpapi:`，并给出常见坑 |
 | **v1.3.1** | 依赖体检误报修正（npm 提升的依赖被当成缺失） |
@@ -662,7 +663,9 @@ node extensions/webdav-backup/verify-load.mjs
 | 想立刻看到日志 | `/backup-log` |
 | DPAPI 解密失败 | 密文只能在本机本用户下解；换机器/换用户需重新 `/backup keys set` |
 | 提示「环境变量未设置」 | `/backup keys set` 改用 dpapi，或先设好该环境变量 |
+| 恢复报 `HTTP 423` | 网盘并发锁；v1.4.0+ 会自动重试（指数退避，尊重 `Retry-After`）。若持续失败，请确认没有安装**两份** backup 插件（退出时会同时备份），可用 `/backup list` + `pi list` 检查 |
 | 恢复报 `HTTP 302` | Cloudreve/群晖等把下载重定向到对象存储（腾讯云 COS 等）；客户端已自动跟随跨主机 302（不携带凭据），请升级到 v1.1.0+ |
+| 恢复后 `settings.json` 多了无效路径 | v1.4.0+ 已过滤旧机器的绝对路径本地源；旧版残留可手动删除 |
 | 恢复后插件不生效 | 若备份时未开启 `includePlugins`，插件代码（`node_modules`）不在备份里，需联网补装：`/backup repair-plugins`（可带 `--dir`）。推荐下次备份开启 `includePlugins: true`，下次即可一键还原 |
 | 写回时提示跳过某些文件 | 归档里是 `__REDACTED__` 而本地已有真实密钥时会被跳过（避免把真密钥抹掉）；确认要覆盖可加 `--force` |
 | 补装报 `git clone` 失败 | 确认能访问 github.com 等源；ref 是 commit SHA 时会自动回退为完整 clone + checkout，仍失败则看日志里的 git 输出 |

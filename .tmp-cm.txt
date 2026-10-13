@@ -1,0 +1,17 @@
+fix: 跨平台健壮性（旧机绝对路径 + WebDAV 重试）
+
+两个实测确认的已知 bug：
+
+1) 跨机同步带入旧机器绝对路径
+   `pi install /绝对/路径` 会把该路径写进 settings.json。跨机恢复时合并会原样保留，
+   在目标机上无效（实测：Windows 的 E:\... 出现在 Linux 的 packages 里）。
+   修复：新增 isMachineSpecificPackagePath()，合并（含全新机场景）时过滤盘符路径、
+   POSIX 绝对路径、UNC；npm:/git:/https: 与相对路径不受影响。
+
+2) WebDAV 423 Locked 等瞬时错误无重试
+   网盘并发/维护时返回 423/429/5xx，此前一次抖动即整次失败（实测两份插件并发上传）。
+   修复：requestWithRetry() 指数退避重试（尊重 Retry-After，上限 4 次），
+   覆盖 PUT/MKCOL/DELETE/PROPFIND/HEAD/GET 与网络层错误。
+
+测试：新增 test-webdav.mjs（dav-mock 支持故障注入，10 项）；
+test-apply 增跨平台路径回归（73 项）。共 12 个测试文件、506 项断言、0 失败。

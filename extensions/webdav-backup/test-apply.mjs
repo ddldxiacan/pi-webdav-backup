@@ -29,7 +29,7 @@ import { collectFiles } from "./collect.mjs";
 import { runBackup } from "./backup.mjs";
 import { restoreBackup } from "./restore.mjs";
 import { analyzePlugins } from "./packages.mjs";
-import { applyRestoredFiles, listRestoredFiles, hasPluginCode, pluginRootRel, packageIdentity, mergeSettingsPackages } from "./apply.mjs";
+import { applyRestoredFiles, listRestoredFiles, hasPluginCode, pluginRootRel, packageIdentity, mergeSettingsPackages, isMachineSpecificPackagePath } from "./apply.mjs";
 
 let pass = 0;
 let fail = 0;
@@ -304,6 +304,32 @@ async function main() {
     const m = mergeSettingsPackages('{"packages":["npm:A","npm:B"],"theme":"light"}', '{"packages":["npm:B@2"],"theme":"dark"}');
     const o = JSON.parse(m);
     check("合并保留本机声明优先、追加备份独有", JSON.stringify(o.packages) === JSON.stringify(["npm:B@2", "npm:A"]) && o.theme === "light", String(m));
+  }
+
+  // ── 8b. 回归：跨机同步不得带入旧机器的绝对路径本地源
+  {
+    // isMachineSpecificPackagePath 单测
+    check("识别 Windows 盘符路径", isMachineSpecificPackagePath("E:\\Users\\me\\ext") === true);
+    check("识别正斜杠盘符路径", isMachineSpecificPackagePath("C:/Users/me/ext") === true);
+    check("识别 POSIX 绝对路径", isMachineSpecificPackagePath("/home/me/ext") === true);
+    check("识别 UNC 路径", isMachineSpecificPackagePath("\\\\server\\share\\ext") === true);
+    check("npm 源不误判", isMachineSpecificPackagePath("npm:foo") === false);
+    check("git 源不误判", isMachineSpecificPackagePath("git:github.com/u/r@v1") === false);
+    check("https 源不误判", isMachineSpecificPackagePath("https://github.com/u/r") === false);
+    check("相对路径不误判（可移植）", isMachineSpecificPackagePath("./ext") === false);
+
+    // 合并时：备份里的 Windows 绝对路径不得进入 Linux 的 packages
+    const backup = JSON.stringify({ packages: ["npm:pi-signal-footer", "E:\\Users\\Administrator\\Desktop\\projects\\pi-webdav-backup"] });
+    const live = JSON.stringify({ packages: ["npm:@zhangweiii/pi-status-line"] });
+    const merged = JSON.parse(mergeSettingsPackages(backup, live));
+    check("合并过滤掉旧机器绝对路径", !merged.packages.some((p) => /^[A-Za-z]:[\\/]/.test(p)), JSON.stringify(merged.packages));
+    check("合并仍保留可移植的 npm 源", merged.packages.includes("npm:pi-signal-footer"), JSON.stringify(merged.packages));
+    check("合并保留本机声明", merged.packages.includes("npm:@zhangweiii/pi-status-line"));
+
+    // 全新机（本机无 packages）：同样要过滤外来绝对路径
+    const fresh = mergeSettingsPackages(backup, JSON.stringify({ theme: "dark" }));
+    check("全新机场景也过滤外来绝对路径", fresh !== null && !JSON.parse(fresh).packages.some((p) => /^[A-Za-z]:[\\/]/.test(p)), String(fresh));
+    check("全新机仅剩可移植源则不改写", mergeSettingsPackages('{"packages":["npm:A"]}', '{}') === null);
   }
 
   // ── 9. 回归：npm/package.json 必须合并 dependencies（否则 pi 会卸载本机独有插件）

@@ -95,11 +95,39 @@ export function pluginRootRel(rel) {
   return null;
 }
 
-/** 取 packages 声明的来源字符串（兼容字符串与 { source, ... } 对象） */
+/**
+ * 取 packages 声明的来源字符串（兼容字符串与 { source, ... } 对象）
+ */
 function packageSourceString(p) {
   if (typeof p === "string") return p;
   if (p && typeof p === "object" && typeof p.source === "string") return p.source;
   return null;
+}
+
+/**
+ * 判断一条 packages 声明是否是「本机绝对路径」形式的本地源。
+ *
+ * 为何重要：`pi install /绝对/路径` 会把该机器的绝对路径写进 settings.json。
+ * 跨平台/跨机器恢复时，这种路径在目标机上必然无效（且可能指到完全无关的位置），
+ * 所以合并时要过滤掉，不要带过去。
+ *
+ * 只认「路径形」字符串；`npm:` / `git:` / `https://` / `builtin:` 等来源不受影响。
+ * 注意：相对路径（如 `./ext`、`ext`）是可移植的，不过滤。
+ */
+export function isMachineSpecificPackagePath(source) {
+  const s = packageSourceString(source);
+  if (!s) return false;
+  const v = s.trim();
+  if (!v) return false;
+  // 显式来源前缀：不是本地路径
+  if (/^(npm:|git:|github:|https?:|ssh:|builtin:|file:)/i.test(v)) return false;
+  // Windows 盘符绝对路径：C:\foo 或 C:/foo
+  if (/^[A-Za-z]:[\\/]/.test(v)) return true;
+  // UNC 路径：\\server\share
+  if (/^\\\\/.test(v)) return true;
+  // POSIX 绝对路径：/home/me/ext（含 \\home 形式的 Windows 风格根部）
+  if (v.startsWith("/") || v.startsWith("\\\\")) return true;
+  return false;
 }
 
 /**
@@ -138,11 +166,18 @@ export function mergeSettingsPackages(backupText, localText) {
 
   const backupPkgs = Array.isArray(backup.packages) ? backup.packages : [];
   const localPkgs = Array.isArray(local?.packages) ? local.packages : [];
-  // 本机没有任何声明 → 直接用备份版即可（全新机器场景）
-  if (localPkgs.length === 0) return null;
+
+  // 本机没有任何声明（新机场景）：用备份版，但仍过滤掉旧机器专属的绝对路径
+  if (localPkgs.length === 0) {
+    const kept = backupPkgs.filter((p) => !isMachineSpecificPackagePath(p));
+    if (kept.length === backupPkgs.length) return null; // 无外来源，无需改写
+    return JSON.stringify({ ...backup, packages: kept }, null, 2);
+  }
 
   const localIds = new Set(localPkgs.map(packageIdentity).filter(Boolean));
   const extra = backupPkgs.filter((p) => {
+    // 备份里指向旧机器绝对路径的本地源，在目标机上无效 → 不合并
+    if (isMachineSpecificPackagePath(p)) return false;
     const id = packageIdentity(p);
     return id && !localIds.has(id);
   });

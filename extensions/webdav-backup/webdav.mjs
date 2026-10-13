@@ -17,6 +17,30 @@ import { URL } from "node:url";
 const UA = "pi-webdav-backup/1.0";
 const MAX_REDIRECTS = 5;
 
+/**
+ * 瞬时错误重试参数。
+ *
+ * 背景：网盘（坚果云/群晖/Cloudreve 等）在并发上传、扫描或维护时会返回
+ * 423 Locked / 429 / 5xx；同一文件在稍后重试即可成功。之前没有任何重试，
+ * 一次抖动就导致整次备份失败（实测：两个实例同时退出备份 → 423）。
+ */
+const MAX_RETRIES = 4;
+const RETRY_BASE_DELAY_MS = 800;
+const RETRYABLE_STATUS = new Set([423, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_METHODS = new Set(["PUT", "MKCOL", "DELETE", "PROPFIND", "HEAD", "GET"]);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 解析 Retry-After（秒数或 HTTP 日期），返回毫秒；无法解析返回 null */
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const s = String(value).trim();
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const t = Date.parse(s);
+  if (!Number.isNaN(t)) return Math.max(0, t - Date.now());
+  return null;
+}
+
 function request(url, { method, headers = {}, body = null, timeoutMs = 60000, insecureTls = false, redirects = MAX_REDIRECTS }) {
   return new Promise((resolve, reject) => {
     let u;
@@ -100,6 +124,34 @@ function basicAuth(username, password) {
   return { Authorization: `Basic ${token}` };
 }
 
+/**
+ * 带重试的请求：对 423/429/5xx 与网络抖动指数据退避重试（仅幂等方法）。
+ * PUT 幂等（整体覆盖同名文件），故也可安全重试。
+ * @returns {Promise<{status:number, headers:object, body:Buffer}>}
+ */
+async function requestWithRetry(url, opts) {
+  const method = String(opts.method || "GET").toUpperCase();
+  const retryable = RETRYABLE_METHODS.has(method);
+  let lastRes = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let res;
+    try {
+      res = await request(url, opts);
+    } catch (e) {
+      // 网络层错误（超时/断连）也重试
+      if (!retryable || attempt === MAX_RETRIES) throw e;
+      await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt);
+      continue;
+    }
+    lastRes = res;
+    if (!retryable || !RETRYABLE_STATUS.has(res.status) || attempt === MAX_RETRIES) return res;
+    const hinted = parseRetryAfter(res.headers?.["retry-after"]);
+    const delay = hinted ?? RETRY_BASE_DELAY_MS * 2 ** attempt;
+    await sleep(Math.min(delay, 15000));
+  }
+  return lastRes;
+}
+
 export class WebDAVClient {
   constructor({ baseUrl, username, password, timeoutMs = 60000, insecureTls = false }) {
     if (!/^https?:\/\//i.test(baseUrl)) {
@@ -122,7 +174,7 @@ export class WebDAVClient {
   }
 
   async #req(method, remotePath, { headers = {}, body = null } = {}) {
-    return request(this.urlFor(remotePath), {
+    return requestWithRetry(this.urlFor(remotePath), {
       method,
       headers: { ...this.auth, ...headers },
       body,
