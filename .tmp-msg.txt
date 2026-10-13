@@ -1,0 +1,7 @@
+fix: 依赖体检误报（npm 提升的依赖被当成缺失）
+
+packages.mjs 的 missingDeps 原来只查包自身 node_modules，与 pi 的
+hasMissingGitDependencies 一致——但那套逻辑适用于 git 包（pi 在包目录内 npm install），
+套到 npm 包上会误报：npm 把依赖提升到 agentDir/npm/node_modules，包目录下并没有。
+
+改为按 Node 模块解析算法沿祖先目录逐级查找，命中任一祖先 node_modules 即视为已安装。

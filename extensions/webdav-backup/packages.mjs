@@ -16,7 +16,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 
 /**
@@ -164,13 +164,35 @@ function readDeps(pkgDir) {
 }
 
 /**
- * 缺依赖检测：逐个依赖名查 node_modules（同 pi 的 hasMissingGitDependencies），
- * 只看 dependencies。只判断 node_modules 目录存在会漏掉「拷了一半」的情况。
+ * 依赖解析根：从 pkgDir 起逐级向上收集所有 node_modules（Node 模块解析算法）。
+ * npm 的依赖会被提升到父级（如 agentDir/npm/node_modules），只查 pkgDir/node_modules
+ * 会误报“缺依赖”——尤其是 npm 安装的包。
+ */
+function dependencyRoots(pkgDir) {
+  const roots = [];
+  let dir = pkgDir;
+  for (let i = 0; i < 12; i++) {
+    roots.push(join(dir, "node_modules"));
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return roots;
+}
+
+/**
+ * 缺依赖检测：逐个依赖名沿 Node 解析路径查找（含祖先 node_modules 的提升）。
+ * 只看 dependencies；只判断“包目录/node_modules 存在”会漏掉「拷了一半」的情况。
  * 返回缺失的依赖名数组；无法判断时返回 null。
  */
 function missingDeps(pkgDir, depNames) {
   if (!depNames) return null;
-  return depNames.filter((name) => !existsSync(join(pkgDir, "node_modules", ...String(name).split("/"))));
+  const roots = dependencyRoots(pkgDir);
+  return depNames.filter((name) => {
+    const parts = String(name).split("/");
+    // 命中任一祖先 node_modules 即视为已安装
+    return !roots.some((root) => existsSync(join(root, ...parts)));
+  });
 }
 
 /**
